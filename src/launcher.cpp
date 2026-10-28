@@ -40,6 +40,7 @@
 #include "mods/languages.h"
 #include "mods/version.h"
 #include "mouse.h"
+#include "netplay.h"
 #include "performance_overlay.h"
 #include "runtime_paths.h"
 #include "updater.h"
@@ -225,6 +226,9 @@ struct Session {
     std::unique_ptr<GamePreparation> preparing;
     std::string game_error;
     float reveal = 0.f;  // the ensō draws itself once when the launcher opens
+    int netplay_mode = options.netplay_host ? 1 : options.netplay_join ? 2 : 0; // 0=Offline, 1=Host LAN, 2=Join LAN
+    char netplay_endpoint[128] = "127.0.0.1:27886";
+    int netplay_delay = int(options.netplay_delay ? options.netplay_delay : netplay::kDefaultDelay);
 
     void Message(std::string title, std::string text, bool close_after = false) {
         popup = Popup{std::move(title), std::move(text), {}, {}, close_after};
@@ -264,6 +268,22 @@ struct Session {
         }
         std::string error;
         if (!Validate(settings, error)) { Message("Check your settings", error); return; }
+        if (netplay_mode == 1) {
+            options.netplay_host = true;
+            options.netplay_join = false;
+            options.netplay_delay = unsigned(std::clamp(netplay_delay, 1, int(netplay::kMaxDelay)));
+        } else if (netplay_mode == 2) {
+            if (!netplay::ParseEndpoint(netplay_endpoint, options.netplay_address, options.netplay_port)) {
+                Message("Check LAN address", "Enter a valid host IPv4 address and optional port (for example 192.168.1.50:27886).");
+                return;
+            }
+            options.netplay_join = true;
+            options.netplay_host = false;
+            options.netplay_delay = unsigned(std::clamp(netplay_delay, 1, int(netplay::kMaxDelay)));
+        } else {
+            options.netplay_host = false;
+            options.netplay_join = false;
+        }
         if (updater) updater->Cancel();
         Apply(settings, true);
         if (!source.empty()) { options.disc = source; options.game.clear(); }
@@ -450,7 +470,7 @@ void PlayPage(Session& s, const Canvas& c, float W, float H) {
         art::Glow(c, center, R, hit.hovered ? 1.45f : 1.f);
         const float eased = 1.f - std::pow(1.f - std::clamp(s.reveal, 0.f, 1.f), 3.f);
         art::Enso(c, center, R, stroke, eased, 1.f);
-        const char* label = options.configure_only ? "Close" : "Play";
+        const char* label = options.configure_only ? "Close" : (s.netplay_mode == 1 ? "Host" : s.netplay_mode == 2 ? "Join" : "Play");
         const float label_h = c.Measure(Weight::Medium, 54, label).y;
         c.TextCentered(Weight::Medium, 54, center.x + 4, center.y - label_h / 2 - 2, Rgb(color::Paper, hit.hovered ? 1.f : 0.94f), label);
     } else {
@@ -461,6 +481,34 @@ void PlayPage(Session& s, const Canvas& c, float W, float H) {
         std::snprintf(percent, sizeof percent, "%d%%", int(std::clamp(value, 0.f, 1.f) * 100.f));
         c.TextCentered(Weight::Medium, 54, center.x + 4, center.y - 30, Rgb(color::Paper), view.state == update::State::Ready ? "100%" : percent);
         c.TextCentered(Weight::Regular, 18.5f, center.x + 4, center.y + 22, Rgb(color::Mist), ("Updating to " + view.release.version).c_str());
+    }
+
+    if (!updating && !options.configure_only) {
+        const float bar_y = footer - 46;
+        const char* modes[] = {"Offline", "Host LAN", "Join LAN"};
+        const float pill_w = 104.f, pill_h = 30.f, gap = 10.f;
+        const float total_w = 3 * pill_w + 2 * gap;
+        float mx = center.x - total_w / 2;
+        for (int i = 0; i < 3; ++i) {
+            const bool active = s.netplay_mode == i;
+            if (Button(modes[i], c, mx, bar_y, mx + pill_w, bar_y + pill_h, modes[i], active)) {
+                s.netplay_mode = i;
+            }
+            mx += pill_w + gap;
+        }
+        if (s.netplay_mode == 1) {
+            char info[64];
+            std::snprintf(info, sizeof(info), "UDP port %u  |  Delay %df", unsigned(options.netplay_port), s.netplay_delay);
+            c.Text(Weight::Regular, 17.5f, mx + 8, bar_y + 5, Rgb(color::Mist), info);
+            const float info_w = c.Measure(Weight::Regular, 17.5f, info).x;
+            if (Link("-##delay_dec", c, mx + 16 + info_w, bar_y + 5, "[-]", false, s.netplay_delay > 1)) --s.netplay_delay;
+            if (Link("+##delay_inc", c, mx + 50 + info_w, bar_y + 5, "[+]", false, s.netplay_delay < int(netplay::kMaxDelay))) ++s.netplay_delay;
+        } else if (s.netplay_mode == 2) {
+            ImGui::SetCursorScreenPos(c.P(mx + 8, bar_y + 2));
+            ImGui::PushItemWidth(c.S(190.f));
+            ImGui::InputText("##netplay_ip", s.netplay_endpoint, sizeof(s.netplay_endpoint));
+            ImGui::PopItemWidth();
+        }
     }
 
     c.Rule(40, W - 40, footer);
@@ -807,7 +855,7 @@ void Draw(Session& s, float scale) {
             if (s.popup->confirm.empty()) s.Dismiss(); else s.Accept();
         }
     } else if (!modal && !io.NavVisible) {
-        if (s.page == Page::Play && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) s.Play();
+        if (s.page == Page::Play && !ImGui::GetIO().WantTextInput && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) s.Play();
         else if (s.page == Page::Game && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) s.LeaveGame();
         else if (s.page != Page::Play && s.page != Page::Game && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) s.page = Page::Play;
     }

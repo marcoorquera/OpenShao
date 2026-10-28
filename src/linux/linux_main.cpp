@@ -30,6 +30,7 @@
 #include "linux/linux_input.h"
 #include "linux/linux_platform.h"
 #include "linux/virtual_keys.h"
+#include "netplay.h"
 #include "performance_overlay.h"
 #include "runtime_paths.h"
 #include "restart.h"
@@ -357,7 +358,9 @@ int main(int argc, char** argv) {
     std::filesystem::path save_directory;
     openshao::storage::DirectoryLock save_lock;
     if (!openshao::OpenSaveDirectory(hdd, save_directory, save_lock)) return 6;
+    if (!openshao::StartNetplay()) return 5;
     if (!kernel::Boot(std::move(game.xbe), IMAGE_XBE, game.dir.string(), save_directory.string())) {
+        openshao::netplay::Stop();
         openshao::paths::ReportError(L"The game failed to start.");
         return 1;
     }
@@ -371,6 +374,7 @@ int main(int argc, char** argv) {
         }
         openshao::controller::Update();
     }
+    openshao::netplay::Stop();
     logx::Flush();
     kernel::Shutdown(0);
 }

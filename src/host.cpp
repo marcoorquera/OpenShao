@@ -25,6 +25,7 @@
 #include "runtime_paths.h"
 #include "restart.h"
 #include "launcher_settings.h"
+#include "netplay.h"
 #include <cerrno>
 #include <limits>
 #include <algorithm>
@@ -114,6 +115,21 @@ int Configure() {
             else options.virtual_gamepads=unsigned(count[0]-L'0');
         }
         else if (arg == L"--launcher-test" && i + 1 < argc) options.launcher_test = argv[++i];
+        else if (arg == L"--netplay-host") {
+            options.netplay_host = true;
+            if (i + 1 < argc && argv[i + 1][0] != L'-') {
+                options.netplay_port = uint16_t(number(argv[++i], 65535));
+            }
+        }
+        else if (arg == L"--netplay-join" && i + 1 < argc) {
+            options.netplay_join = true;
+            const std::wstring wide = argv[++i];
+            std::string narrow(wide.begin(), wide.end());
+            if (!netplay::ParseEndpoint(narrow, options.netplay_address, options.netplay_port)) invalid = true;
+        }
+        else if (arg == L"--netplay-delay" && i + 1 < argc) {
+            options.netplay_delay = unsigned(number(argv[++i], netplay::kMaxDelay));
+        }
         else if (arg == L"--game" && i + 1 < argc) options.game = argv[++i];
         else if (arg == L"--disc" && i + 1 < argc) options.disc = argv[++i];
         else if (arg == L"--timeout" && i + 1 < argc) {
@@ -134,6 +150,10 @@ int Configure() {
     if (options.setup && (options.background || options.host_test || options.validate_disc || options.validate_language_pack)) invalid = true;
     if (options.configure_only && (options.background || options.setup || options.no_launcher || options.validate_disc || options.validate_language_pack)) invalid = true;
     if (!options.disc.empty() && !options.game.empty()) invalid = true;
+    if (options.netplay_host && options.netplay_join) invalid = true;
+    if ((options.netplay_host || options.netplay_join) &&
+        (options.background || options.configure_only || options.setup || options.validate_disc || options.validate_language_pack))
+        invalid = true;
     if (!options.launcher_test.empty() && (options.background || options.no_launcher || options.setup || options.validate_disc ||
                                            options.validate_language_pack || options.data_dir.empty())) invalid = true;
     if(options.restart_parent || options.restart_ready || !options.restart_language.empty() || !options.restart_voice_language.empty()) {
@@ -160,6 +180,23 @@ int Configure() {
     }
     std::string error;
     if (!paths::Initialize(app::ExeDir(), options.background, options.data_dir, error, options.paths || options.restart_parent!=0)) {
+        if (paths::DataInUse() && (options.netplay_join || options.netplay_host) && options.data_dir.empty()) {
+            const auto base_root = paths::Root();
+            const auto peer_root = base_root / "netplay-peer";
+            std::error_code ec;
+            std::filesystem::create_directories(peer_root, ec);
+            for (const char* file : {"settings.toml", "game-source.toml"}) {
+                if (std::filesystem::is_regular_file(base_root / file, ec)) {
+                    std::filesystem::copy_file(base_root / file, peer_root / file,
+                                               std::filesystem::copy_options::overwrite_existing, ec);
+                }
+            }
+            if (paths::Initialize(app::ExeDir(), options.background, peer_root, error, false)) {
+                if (options.save_dir.empty() && !options.portable_saves) options.save_dir = peer_root / "hdd";
+                options.data_dir = paths::Root();
+                return 0;
+            }
+        }
         if (paths::DataInUse()) { ShowAlreadyOpen(); return kAlreadyOpen; }
         std::fprintf(stderr, "Cannot prepare application data: %s\n", error.c_str());
         paths::ReportError(L"The application data folder could not be opened. Check its permissions.");
@@ -171,6 +208,22 @@ int Configure() {
     }
     options.data_dir = paths::Root();
     return 0;
+}
+
+bool StartNetplay() {
+    if (!options.netplay_host && !options.netplay_join) return true;
+    netplay::Config cfg{};
+    cfg.role = options.netplay_host ? netplay::Role::Host : netplay::Role::Client;
+    cfg.host_address = options.netplay_address;
+    cfg.port = options.netplay_port;
+    cfg.input_delay = options.netplay_delay ? options.netplay_delay : netplay::kDefaultDelay;
+    std::string error;
+    if (!netplay::Start(cfg, error)) {
+        LOGE("Netplay initialization failed: %s", error.c_str());
+        paths::ReportError(std::filesystem::path(std::u8string(error.begin(), error.end())).wstring());
+        return false;
+    }
+    return true;
 }
 
 bool OpenSaveDirectory(const std::wstring& name, std::filesystem::path& result, storage::DirectoryLock& lock) {

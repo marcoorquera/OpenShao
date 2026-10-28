@@ -82,6 +82,7 @@ def main():
         '    std::filesystem::path save_directory;\n'
         '    openshao::storage::DirectoryLock save_lock;\n'
         '    if (!openshao::OpenSaveDirectory(hdd, save_directory, save_lock)) return 6;\n'
+        '    if (!openshao::StartNetplay()) return 5;\n'
         '    if (app::Instance())\n        SetWindowTextW')
     text = '#include "restart.h"\n' + text
     text = replace_once(text, 'bool relaunched = std::wcsstr(GetCommandLineW(), L"--relaunched") != nullptr;',
@@ -310,7 +311,7 @@ uint32_t OpenOnDisc(''')
         '    else if (t.disc) FillNetworkInfo(a[1], *t.entry);')
     (args.out / "files.cpp").write_text(files, encoding="utf-8")
     boot = (args.sdk / "runtime/kernel/boot.cpp").read_text(encoding="utf-8")
-    boot = '#include "host.h"\n#include "runtime_paths.h"\n#include "language_pack.h"\n#include "mods/runtime.h"\n' + boot
+    boot = '#include "host.h"\n#include "netplay.h"\n#include "runtime_paths.h"\n#include "language_pack.h"\n#include "mods/runtime.h"\n' + boot
     boot = replace_once(boot, '    if (app::kGame.loaded) app::kGame.loaded();',
         '    std::string language_error;\n'
         '    if (!openshao::language::ApplyFonts(std::span<uint8_t>(g_base, X86ImageEnd), language_error)) {\n'
@@ -330,9 +331,44 @@ uint32_t OpenOnDisc(''')
     boot = replace_once(boot, 'return g_launch_file.substr(0, g_launch_file.find_last_of("/\\\\") + 1) + "display.bin";',
         'return (openshao::paths::Cache() / "display.bin").string();')
     boot = replace_once(boot, '    std::_Exit(code);',
+        '    openshao::netplay::Stop();\n'
         '    if (code) openshao::paths::ReportError(L"The game stopped with error code " + std::to_wstring(code) + L".");\n    std::_Exit(code);')
     boot = replace_once(boot, "void Relaunch(const char* exe) {", "void Relaunch(const char* exe) {\n    if (openshao::options.background) { LOGE(\"Relaunch refused during isolated background test\"); Shutdown(50); }")
     (args.out / "boot.cpp").write_text(boot, encoding="utf-8")
+    krnl = (args.sdk / "runtime/kernel/xboxkrnl.cpp").read_text(encoding="utf-8")
+    krnl = '#include "netplay.h"\n' + krnl
+    krnl = replace_once(krnl, "uint64_t InterruptTime() {",
+        "uint64_t InterruptTime() {\n    if (openshao::netplay::IsActive()) return openshao::netplay::GuestInterruptTime100ns();")
+    krnl = replace_once(krnl,
+        "            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();\n"
+        "            W32(g_tick_count_va, uint32_t(ms));\n"
+        "            PutSystemTime(DataAddress(120), InterruptTime());\n"
+        "            PutSystemTime(DataAddress(154), uint64_t(Now100ns()));",
+        "            if (openshao::netplay::IsActive()) {\n"
+        "                W32(g_tick_count_va, openshao::netplay::GuestTickCountMs());\n"
+        "                PutSystemTime(DataAddress(120), openshao::netplay::GuestInterruptTime100ns());\n"
+        "                PutSystemTime(DataAddress(154), openshao::netplay::GuestSystemTime100ns());\n"
+        "            } else {\n"
+        "                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();\n"
+        "                W32(g_tick_count_va, uint32_t(ms));\n"
+        "                PutSystemTime(DataAddress(120), InterruptTime());\n"
+        "                PutSystemTime(DataAddress(154), uint64_t(Now100ns()));\n"
+        "            }")
+    krnl = replace_once(krnl,
+        "KERNEL_EXPORT(128, KeQuerySystemTime, 1) {\n    W64(a[0], uint64_t(Now100ns()));",
+        "KERNEL_EXPORT(128, KeQuerySystemTime, 1) {\n    W64(a[0], openshao::netplay::IsActive() ? openshao::netplay::GuestSystemTime100ns() : uint64_t(Now100ns()));")
+    krnl = replace_once(krnl,
+        "KERNEL_EXPORT(228, NtSetSystemTime, 2) {\n    if (a[1]) W64(a[1], uint64_t(Now100ns()));",
+        "KERNEL_EXPORT(228, NtSetSystemTime, 2) {\n    if (a[1]) W64(a[1], openshao::netplay::IsActive() ? openshao::netplay::GuestSystemTime100ns() : uint64_t(Now100ns()));")
+    krnl = replace_once(krnl,
+        "KERNEL_EXPORT(126, KeQueryPerformanceCounter, 0) {",
+        "KERNEL_EXPORT(126, KeQueryPerformanceCounter, 0) {\n"
+        "    if (openshao::netplay::IsActive()) {\n"
+        "        uint64_t v = openshao::netplay::GuestPerfCounter();\n"
+        "        ctx.edx = uint32_t(v >> 32);\n"
+        "        return uint32_t(v);\n"
+        "    }")
+    (args.out / "xboxkrnl.cpp").write_text(krnl, encoding="utf-8")
     pads = (args.sdk / "runtime/core/input.cpp").read_text(encoding="utf-8")
     pads = '#include "host.h"\n' + pads
     pads = replace_once(pads, "Pad Poll(int port) {", "Pad Poll(int port) {\n    if (openshao::options.background) {\n        Pad p{}; p.connected = port == 0;\n        if (app::kGame.pad) app::kGame.pad(port, p);\n        return p;\n    }")
@@ -376,7 +412,7 @@ uint32_t OpenOnDisc(''')
     audio = replace_once(audio, "            render(b, kFrames);", "            render(b, kFrames);\n            openshao::scorpion::audio_preview::Mix(b, kFrames);")
     (args.out / "xaudio2.cpp").write_text(audio, encoding="utf-8")
     d3d = (args.sdk / "runtime/xdk/d3d8.cpp").read_text(encoding="utf-8")
-    d3d = '#include "aspect_ratio.h"\n#include "sfd_lock_compat.h"\n#include "sfd_filter_compat.h"\n#include "vblank_compat.h"\n#include <array>\nstatic std::array<uint32_t, 13> g_openshao_present{};\n' + d3d
+    d3d = '#include "aspect_ratio.h"\n#include "controller.h"\n#include "netplay.h"\n#include "sfd_lock_compat.h"\n#include "sfd_filter_compat.h"\n#include "vblank_compat.h"\n#include <array>\nstatic std::array<uint32_t, 13> g_openshao_present{};\n' + d3d
     # cstdint must precede the snapshot declaration when this TU is compiled alone.
     d3d = '#include "platform_compat.h"\n#include <cstdint>\n#include "core/diag.h"\n' + d3d
     d3d = replace_once(d3d, '    if (!h) h = 480;\n', '    if (!h) h = 480;\n    std::memcpy(g_openshao_present.data(), HostPtr(pp), sizeof(g_openshao_present));\n    g_openshao_present[0] = w; g_openshao_present[1] = h; g_openshao_present[3] = count;\n')
@@ -405,6 +441,14 @@ uint32_t OpenOnDisc(''')
     # report actual swaps once per second. Do not alter playback timing.
     d3d = replace_once(d3d, '    g_presents++;',
         '    g_presents++;\n'
+        '    if (openshao::netplay::IsActive()) {\n'
+        '        uint32_t state_hash = 0;\n'
+        '        if ((openshao::netplay::CurrentFrame() % 60u) == 0u) {\n'
+        '            state_hash = (R32(0x6C9308) * 2654435761u) ^ R32(0x598430 + 0x38) ^ R32(0x006394BC) ^ 0x5348414Fu;\n'
+        '            if (!state_hash) state_hash = 1;\n'
+        '        }\n'
+        '        openshao::netplay::AdvanceFrame(openshao::controller::PollLocal(), state_hash);\n'
+        '    }\n'
         '    { static uint64_t last_tick=0; static uint32_t last_swap=0;\n'
         '      const uint64_t tick=GetTickCount64();\n'
         '      if (diag::Perf() && tick-last_tick>=1000) {\n'

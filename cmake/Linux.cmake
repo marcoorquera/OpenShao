@@ -3,7 +3,7 @@
 # top-level CMakeLists.txt after code generation and runtime adaptation.
 find_package(Threads REQUIRED)
 
-set(OPENSHAO_LINUX_EXCLUDE "/kernel/files\\.cpp$|/app/[a-z_]+\\.cpp$|/core/input\\.cpp$|/audio/xaudio2\\.cpp$|/gpu/(d3d12|vertex|shaders|render_thread)\\.cpp$|/xdk/(d3d8|xapi|dsound|xnet)\\.cpp$")
+set(OPENSHAO_LINUX_EXCLUDE "/kernel/(files|xboxkrnl)\\.cpp$|/app/[a-z_]+\\.cpp$|/core/input\\.cpp$|/audio/xaudio2\\.cpp$|/gpu/(d3d12|vertex|shaders|render_thread)\\.cpp$|/xdk/(d3d8|xapi|dsound|xnet)\\.cpp$")
 list(FILTER XBE_RUNTIME_SOURCES EXCLUDE REGEX "${OPENSHAO_LINUX_EXCLUDE}")
 
 set(OPENSHAO_IMGUI_CORE
@@ -13,7 +13,7 @@ set(OPENSHAO_IMGUI_CORE
 set(OPENSHAO_SHARED_SOURCES
     src/host.cpp src/keyboard.cpp src/game_info.cpp src/game_files.cpp src/runtime_paths.cpp
     src/game_setup.cpp src/game_import.cpp src/save_storage.cpp src/performance_overlay.cpp
-    src/voice_language.cpp src/scorpion_voice.cpp src/scorpion_preview_audio.cpp src/scorpion_preview_adx.cpp src/scorpion_preview_mix.cpp src/controller.cpp src/launcher.cpp src/launcher_art.cpp src/updater.cpp "${OPENSHAO_LAUNCHER_FONTS}" src/launcher_settings.cpp src/game_preferences.cpp src/brightness.cpp
+    src/voice_language.cpp src/scorpion_voice.cpp src/scorpion_preview_audio.cpp src/scorpion_preview_adx.cpp src/scorpion_preview_mix.cpp src/controller.cpp src/netplay.cpp src/launcher.cpp src/launcher_art.cpp src/updater.cpp "${OPENSHAO_LAUNCHER_FONTS}" src/launcher_settings.cpp src/game_preferences.cpp src/brightness.cpp
     src/menu_text.cpp src/menu_renderer.cpp src/system_text.cpp
     src/recomp_settings_model.cpp src/recomp_settings.cpp src/restart.cpp src/restart_process.cpp src/restart_boot.cpp
     src/mouse_state.cpp src/raster_compat.cpp src/ed_nexus.cpp src/pause_recomp.cpp src/strip_orientation.cpp src/strip_orientation_hooks.cpp src/survival5_recovery_hooks.cpp src/aspect_ratio.cpp src/aspect_hooks.cpp
@@ -42,7 +42,7 @@ set(OPENSHAO_LINUX_SOURCES
     "${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp")
 
 add_executable(OpenShao ${XBE_RUNTIME_SOURCES} ${OPENSHAO_IMGUI_CORE} ${GEN_SOURCES}
-    "${HOST_ADAPTED}/boot.cpp" "${HOST_ADAPTED}/d3d8.cpp" "${HOST_ADAPTED}/xapi.cpp" "${HOST_ADAPTED}/dsound.cpp"
+    "${HOST_ADAPTED}/boot.cpp" "${HOST_ADAPTED}/xboxkrnl.cpp" "${HOST_ADAPTED}/d3d8.cpp" "${HOST_ADAPTED}/xapi.cpp" "${HOST_ADAPTED}/dsound.cpp"
     "${HOST_ADAPTED}/vertex.cpp" "${HOST_ADAPTED}/shaders.cpp" "${HOST_ADAPTED}/files.cpp" "${HOST_ADAPTED}/settings.cpp"
     "${HOST_ADAPTED}/render_thread.cpp"
     ${OPENSHAO_SHARED_SOURCES} ${OPENSHAO_LINUX_SOURCES} "${CMAKE_CURRENT_BINARY_DIR}/openshao_xbe.cpp")
@@ -80,6 +80,7 @@ openshao_linux_test(recomp_language_pack SOURCES tests/recomp_language_pack_test
     src/virtual_file.cpp "${OPENSHAO_RECOMP_SDK}/runtime/kernel/crypto.cpp" LIBS miniz openshao_mods)
 openshao_linux_test(recomp_launcher_settings SOURCES tests/recomp_launcher_settings_test.cpp src/launcher_settings.cpp LIBS tomlplusplus::tomlplusplus)
 openshao_linux_test(recomp_mouse SOURCES tests/recomp_mouse_test.cpp src/mouse_state.cpp)
+openshao_linux_test(recomp_netplay SOURCES tests/recomp_netplay_test.cpp src/netplay.cpp LIBS Threads::Threads)
 openshao_linux_test(recomp_sfd_lock SOURCES tests/recomp_sfd_lock_test.cpp)
 openshao_linux_test(recomp_vblank SOURCES tests/recomp_vblank_test.cpp)
 openshao_linux_test(recomp_input_mode SOURCES tests/recomp_input_mode_test.cpp)

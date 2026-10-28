@@ -16,6 +16,7 @@
 #include "host.h"
 #include "keyboard.h"
 #include "mouse.h"
+#include "netplay.h"
 #include "app/app.h"
 #include "core/input.h"
 #include "core/log.h"
@@ -121,8 +122,31 @@ void SetMultiplayer(bool enabled) {
     LOGI("input: multiplayer=%d keyboard=%d reserved_port=%d",enabled,auto_keyboard+1,auto_reserved);
 }
 int KeyboardPort() {
+    if (openshao::netplay::IsActive()) return 0;
     std::lock_guard guard(lock);
     return auto_keyboard;
+}
+input::Pad PollLocal() {
+    input::Pad p{};
+    if (Enabled()) {
+        std::lock_guard guard(lock);
+        if (openshao::netplay::IsLoopbackSession()) {
+            const bool two_pads = slots[0].device && slots[1].device;
+            if (openshao::netplay::CurrentRole() == openshao::netplay::Role::Client) {
+                if (two_pads) p = slots[1].state;
+                else if (slots[0].device) p = slots[0].state;
+            } else {
+                // On a single-PC loopback session with one gamepad + keyboard,
+                // keep the single gamepad for Client (P2) while Host (P1) uses keyboard/mouse.
+                if (two_pads && slots[0].device) p = slots[0].state;
+            }
+        } else if (slots[0].device) {
+            p = slots[0].state;
+        }
+    }
+    if (app::kGame.pad) app::kGame.pad(0, p);
+    p.connected = true;
+    return p;
 }
 void Configure(const launcher::Settings& settings) {
     std::lock_guard guard(lock);
@@ -161,6 +185,7 @@ void SetFocused(bool value) {
     }
 }
 bool HasRumble(int port) {
+    if (openshao::netplay::IsActive()) return port == 0 || port == 1;
     std::lock_guard guard(lock);
     const int index=PhysicalPort(port);
     if (index>=0 && slots[index].device) return slots[index].rumble;
@@ -196,7 +221,7 @@ void Update() {
         const auto previous=s.state;s.state={}; auto* pad=s.device;
         if (!pad || !SDL_GamepadConnected(pad)) continue;
         auto& p=s.state; p.connected=true;
-        if (focused) {
+        if (focused || openshao::netplay::IsLoopbackSession()) {
             std::string raw_source;uint32_t raw_buttons=0;
             for(int button=0;button<SDL_GAMEPAD_BUTTON_COUNT;++button)if(SDL_GetGamepadButton(pad,SDL_GamepadButton(button))) {
                 if(raw_source.empty())if(const auto* name=SDL_GetGamepadStringForButton(SDL_GamepadButton(button)))raw_source=name;
@@ -354,6 +379,7 @@ void Init() {
     LOGI("input: SDL %d, %d gamepads; PS4 Bluetooth/USB via HIDAPI",SDL_GetVersion(),count);
 }
 Pad Poll(int port) {
+    if (openshao::netplay::IsActive()) return openshao::netplay::GetSyncedPad(port);
     Pad p{};bool standby=false;
     if (Enabled()) {
         std::lock_guard guard(lock);const int index=PhysicalPort(port);if (index>=0) p=slots[index].state;
@@ -369,6 +395,13 @@ Pad Poll(int port) {
 void Rumble(int port,uint16_t left,uint16_t right) {
     if(left || right)LOG_FIRST(8,"input: game vibration port=%d low=%u high=%u",port,unsigned(left),unsigned(right));
     if (openshao::options.background) return;
+    if (openshao::netplay::IsActive()) {
+        if (port != openshao::netplay::LocalPlayerIndex()) return;
+        if (app::kGame.rumble) app::kGame.rumble(0, left, right);
+        std::lock_guard guard(lock);
+        if (slots[0].device && focused && rumble_enabled) { slots[0].desired[0]=left; slots[0].desired[1]=right; }
+        return;
+    }
     if (app::kGame.rumble) app::kGame.rumble(port,left,right);
     std::lock_guard guard(lock);
     const int index=PhysicalPort(port);

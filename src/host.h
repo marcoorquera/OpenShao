@@ -25,6 +25,11 @@ struct Options {
     std::string restart_voice_language;
     unsigned virtual_gamepads = 0; // isolated hidden diagnostics only
     unsigned timeout = 0;
+    bool netplay_host = false;
+    bool netplay_join = false;
+    std::string netplay_address = "127.0.0.1";
+    uint16_t netplay_port = 27886;
+    unsigned netplay_delay = 1;
     std::filesystem::path game;
     std::filesystem::path disc;
     std::filesystem::path save_dir;
@@ -37,6 +42,7 @@ extern Options options;
 // Exit code of a start that found another OpenShao using the same data folder.
 inline constexpr int kAlreadyOpen = 9;
 int Configure();
+bool StartNetplay();
 void StartWatchdog();
 bool RequestExit();
 int CheckHiddenWindow(void* window, bool display_changed);

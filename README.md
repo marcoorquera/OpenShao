@@ -12,6 +12,7 @@
 </p>
 
 OpenShao is a native PC port of **Mortal Kombat: Shaolin Monks**, made by statically recompiling the original Xbox game.
+This fork builds on the upstream [OpenShao](https://github.com/OAleex/OpenShao) project and adds deterministic UDP frame-lockstep **LAN / Peer-to-Peer Ko-op and Versus Netplay**.
 
 > [!IMPORTANT]
 > OpenShao does not include the game. You need your own **USA/Europe Xbox copy**.
@@ -37,13 +38,16 @@ OpenShao is a native PC port of **Mortal Kombat: Shaolin Monks**, made by static
 
 ## Install
 
-1. Download the [latest release](https://github.com/OAleex/OpenShao/releases/latest) for your system.
+### Windows and Linux (including SteamOS / Steam Deck)
+
+1. Download or build the release package for your system (`Windows-x64.zip` or `Linux-x64.tar.gz`).
 2. Extract it to a folder.
 3. Open **OpenShao**.
 4. Choose your game: an ISO, XISO, ZIP, extracted folder or `default.xbe`.
 5. Select **Play**.
 
 Keep the game image or folder where it is. OpenShao reads it in place.
+On Steam Deck, you can run the native Linux build directly in Desktop Mode or add `OpenShao` as a Non-Steam Game to launch it from Gaming Mode.
 
 ## Update
 
@@ -62,6 +66,7 @@ The first start of 0.3.0 moves the data and saves of earlier releases to the new
 - **Render scale** from 25% to 400%, anisotropic filtering and V-Sync.
 - **Remappable controls** for controllers, keyboard and mouse, with mouse camera support.
 - **Local Ko-op** with keyboard and mouse plus one controller, or two controllers.
+- **LAN / Peer-to-Peer Ko-op and Versus (Netplay)** over UDP frame lockstep between two systems (including Windows and Linux / Steam Deck).
 - **Separate text and voice languages**, including Brazilian Portuguese through a language pack.
 - **Mods** from the [OpenShao-Mods catalog](https://github.com/OAleex/OpenShao-Mods), installed and updated in the launcher.
 
@@ -116,6 +121,19 @@ In Ko-op, the keyboard and mouse are player 1 and a controller is player 2. With
 
 For a controller without a mapping, put an SDL `gamecontrollerdb.txt` in the data folder.
 
+### How does LAN Ko-op (Netplay) work?
+
+Netplay synchronizes both players' inputs on each frame over UDP port `27886`.
+
+1. On the host system (Player 1), open the launcher and select **Host LAN**.
+2. Adjust the frame delay if needed (`1f` to `2f` for local networks).
+3. Select **Play** to start waiting for the peer connection.
+4. On the client system (Player 2), open the launcher and select **Join LAN**.
+5. Enter the host IP address and port, then select **Play**.
+6. Once both systems connect, enter **Ko-op** or **Versus** from the main menu.
+
+To test with two windows on the same computer, connect the client to `127.0.0.1:27886`. The second instance automatically uses an isolated `netplay-peer` data folder when the primary data folder is in use.
+
 ### How do I install mods or the Portuguese language pack?
 
 Open **Mods** in the launcher and select **Install**. A downloaded `.tar.xz` installs through **Install from file**.
@@ -141,6 +159,9 @@ Only one copy can run at a time with the same data folder.
 | `--save-dir <path>` | Use another saves folder for this session |
 | `--portable-saves` | Keep saves in `hdd` next to the executable |
 | `--paths` | Print the folders in use |
+| `--netplay-host [port]` | Host a UDP lockstep netplay session as Player 1 (default port `27886`) |
+| `--netplay-join <host[:port]>` | Join a UDP lockstep netplay session as Player 2 |
+| `--netplay-delay <1..8>` | Set the netplay frame input delay |
 
 ### How do I report a problem?
 
@@ -152,7 +173,7 @@ Include a screenshot for graphical problems. Do not attach game files.
 You need the original `default.xbe`, Python 3.11, Git and a C++ toolchain: Visual Studio 2022 with LLVM 21 on Windows, or Clang 18 on Linux.
 
 ```sh
-git clone https://github.com/OAleex/OpenShao.git
+git clone https://github.com/marcoorquera/OpenShao.git
 cd OpenShao
 git clone https://github.com/TGP482/XboxXBERecomp.git third_party/XboxXBERecomp
 git -C third_party/XboxXBERecomp checkout 40e9c35451305f09ca9d86f677e4b9c2c37ff26b
@@ -168,6 +189,7 @@ The maintainer reviews every change. Validation includes automated tests and gam
 
 ## Credits
 
+Forked from and based on [OpenShao](https://github.com/OAleex/OpenShao) by [OAleex](https://github.com/OAleex).
 Built with [XboxXBERecomp](https://github.com/TGP482/XboxXBERecomp). See [tools and dependencies](UPSTREAM.md), [third-party notices](licenses/THIRD_PARTY.txt) and the [Brazilian Portuguese credits](docs/TRANSLATION_CREDITS.md).
 
 The code is licensed under [GPL-2.0-or-later](LICENSE). The license does not cover the original game or its assets.
