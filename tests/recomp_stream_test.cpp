@@ -222,6 +222,197 @@ int main() {
         Check(ow == 2 && oh == 2, "scaled capture sizes round down to even");
     }
 
+    // 10. Video FEC parity round trip, drop limits, short last chunk, and out-of-order delivery
+    {
+        auto chunk_fec = [](uint32_t frame, const std::vector<uint8_t>& data, uint16_t index, uint8_t group) {
+            VideoChunk c{};
+            c.frame = frame;
+            c.width = 640;
+            c.height = 480;
+            c.total = uint32_t(data.size());
+            c.count = ChunkCount(data.size());
+            c.fec_group = group;
+            c.fec_count = group ? uint8_t((c.count + group - 1) / group) : 0;
+            c.index = index;
+            return c;
+        };
+
+        auto feed_fec = [&](FrameAssembler& a, uint32_t frame, const std::vector<uint8_t>& data,
+                            const std::vector<uint8_t>& parity, uint16_t index, uint8_t group,
+                            std::vector<uint8_t>& out) {
+            VideoChunk c = chunk_fec(frame, data, index, group);
+            if (index < c.count) {
+                return a.Add(c, data.data() + size_t(index) * kMaxChunk, ChunkSize(data, index), out);
+            } else {
+                const size_t g = index - c.count;
+                return a.Add(c, parity.data() + g * kMaxChunk, kMaxChunk, out);
+            }
+        };
+
+        // 10a. 20-chunk frame with group 8: drop one data chunk per group -> completes byte-identical and Recovered() counts it
+        {
+            const auto frame = Encoded(kMaxChunk * 19 + 500, 10);
+            Check(ChunkCount(frame.size()) == 20, "frame has 20 chunks");
+            std::vector<uint8_t> parity;
+            BuildParity(frame.data(), frame.size(), 20, 8, parity);
+            Check(parity.size() == 3 * kMaxChunk, "3 parity chunks produced for 20 chunks with group 8");
+
+            FrameAssembler a;
+            std::vector<uint8_t> out;
+            // Group 0 (0..7): drop 3. Group 1 (8..15): drop 11. Group 2 (16..19): drop 18.
+            for (uint16_t i = 0; i < 20; ++i) {
+                if (i == 3 || i == 11 || i == 18) continue;
+                Check(!feed_fec(a, 1, frame, parity, i, 8, out), "incomplete frame while data chunks arrive");
+            }
+            Check(!feed_fec(a, 1, frame, parity, 20, 8, out), "incomplete after parity 0");
+            Check(!feed_fec(a, 1, frame, parity, 21, 8, out), "incomplete after parity 1");
+            Check(feed_fec(a, 1, frame, parity, 22, 8, out) && out == frame,
+                  "20-chunk frame completes byte-identical with 1 dropped chunk per group");
+            Check(a.Recovered() == 1, "frame completed thanks to parity increments Recovered()");
+        }
+
+        // 10b. Drop two data chunks in one group -> does not complete
+        {
+            const auto frame = Encoded(kMaxChunk * 19 + 500, 11);
+            std::vector<uint8_t> parity;
+            BuildParity(frame.data(), frame.size(), 20, 8, parity);
+            FrameAssembler a;
+            std::vector<uint8_t> out;
+            // Drop chunks 2 and 3 in group 0
+            for (uint16_t i = 0; i < 20; ++i) {
+                if (i == 2 || i == 3) continue;
+                Check(!feed_fec(a, 1, frame, parity, i, 8, out), "two-drop data chunk does not complete");
+            }
+            for (uint16_t p = 20; p < 23; ++p) {
+                Check(!feed_fec(a, 1, frame, parity, p, 8, out), "parity cannot rebuild two missing chunks in one group");
+            }
+            Check(out.empty() && a.Recovered() == 0, "frame with two drops in one group never completes");
+        }
+
+        // 10c. Last-chunk recovery: drop the short last chunk -> rebuilt with the right length
+        {
+            const auto frame = Encoded(kMaxChunk * 3 + 321, 12);
+            Check(ChunkCount(frame.size()) == 4, "frame has 4 chunks");
+            std::vector<uint8_t> parity;
+            BuildParity(frame.data(), frame.size(), 4, 8, parity);
+            Check(parity.size() == kMaxChunk, "1 parity chunk for 4 chunks with group 8");
+
+            FrameAssembler a;
+            std::vector<uint8_t> out;
+            for (uint16_t i = 0; i < 3; ++i) {
+                Check(!feed_fec(a, 1, frame, parity, i, 8, out), "early data chunks do not complete");
+            }
+            // Drop short last chunk (index 3), feed parity chunk (index 4)
+            Check(feed_fec(a, 1, frame, parity, 4, 8, out), "parity recovers short last chunk");
+            Check(out.size() == frame.size() && out == frame, "rebuilt last chunk has correct truncated length");
+            Check(a.Recovered() == 1, "short last chunk recovery counted");
+        }
+
+        // 10d. Parity chunks before data chunks arrive in any order
+        {
+            const auto frame = Encoded(kMaxChunk * 9 + 100, 13);
+            Check(ChunkCount(frame.size()) == 10, "frame has 10 chunks");
+            std::vector<uint8_t> parity;
+            BuildParity(frame.data(), frame.size(), 10, 8, parity);
+            Check(parity.size() == 2 * kMaxChunk, "2 parity chunks for 10 chunks with group 8");
+
+            FrameAssembler a;
+            std::vector<uint8_t> out;
+            // Drop chunk 5 in group 0. Send parity chunks first, then data in scrambled order.
+            Check(!feed_fec(a, 1, frame, parity, 11, 8, out), "parity 1 arrives first");
+            Check(!feed_fec(a, 1, frame, parity, 10, 8, out), "parity 0 arrives second");
+            const uint16_t arrival_order[] = {9, 8, 7, 6, 4, 3, 2, 1, 0};
+            for (size_t i = 0; i < sizeof(arrival_order) / sizeof(arrival_order[0]); ++i) {
+                const bool complete = feed_fec(a, 1, frame, parity, arrival_order[i], 8, out);
+                if (i + 1 == sizeof(arrival_order) / sizeof(arrival_order[0])) {
+                    Check(complete && out == frame, "scrambled arrival with parity first completes byte-identical");
+                } else {
+                    Check(!complete, "incomplete during scrambled arrival");
+                }
+            }
+            Check(a.Recovered() == 1, "out of order parity recovery counted");
+        }
+    }
+
+    // 11. BitrateController rate adaptation, clamps, limits, and small report handling
+    {
+        BitrateController bc(kVideoBitrate);
+        Check(bc.Bitrate() == kVideoBitrate, "initial bitrate matches start");
+
+        // Small reports (< 20 chunks expected) are ignored
+        StreamStats small{};
+        small.chunks_expected = 19;
+        small.chunks_received = 0;
+        small.frames_lost = 5;
+        bc.Update(small, 1000);
+        Check(bc.Bitrate() == kVideoBitrate, "reports with chunks_expected < 20 are ignored");
+
+        // Loss > 5% drops bitrate by 25%, rate-limited to once per 1000 ms
+        StreamStats lossy{};
+        lossy.chunks_expected = 100;
+        lossy.chunks_received = 90; // 10% loss
+        lossy.frames_lost = 0;
+        bc.Update(lossy, 1000);
+        Check(bc.Bitrate() == 6'000'000, "10% loss drops 8 Mbps to 6 Mbps");
+        bc.Update(lossy, 1500);
+        Check(bc.Bitrate() == 6'000'000, "drop is rate-limited to once per 1000 ms");
+        bc.Update(lossy, 2000);
+        Check(bc.Bitrate() == 4'500'000, "drop after 1000 ms decreases rate to 4.5 Mbps");
+
+        // frames_lost > 0 triggers drop even with 0% chunk loss
+        StreamStats lost_frame{};
+        lost_frame.chunks_expected = 100;
+        lost_frame.chunks_received = 100;
+        lost_frame.frames_lost = 1;
+        bc.Update(lost_frame, 3000);
+        Check(bc.Bitrate() == 3'375'000, "frames_lost > 0 drops bitrate");
+
+        // Lower clamp holds at kMinVideoBitrate (2,000,000)
+        bc.Update(lossy, 4000); // 3375000 * 0.75 = 2531250
+        Check(bc.Bitrate() == 2'531'250, "drop to 2.53 Mbps");
+        bc.Update(lossy, 5000); // 2531250 * 0.75 = 1898437 -> clamp 2000000
+        Check(bc.Bitrate() == kMinVideoBitrate, "bitrate clamps to kMinVideoBitrate");
+        bc.Update(lossy, 6000);
+        Check(bc.Bitrate() == kMinVideoBitrate, "further loss stays clamped at min");
+
+        // Clean reports (< 1% loss, no frames lost) raise rate after 3000 ms in a row, at most once per 2000 ms
+        StreamStats clean{};
+        clean.chunks_expected = 100;
+        clean.chunks_received = 100;
+        clean.frames_lost = 0;
+        bc.Update(clean, 10000); // streak starts at 10000
+        Check(bc.Bitrate() == kMinVideoBitrate, "clean report before 3000 ms does not raise rate");
+        bc.Update(clean, 12000); // 2000 ms clean
+        Check(bc.Bitrate() == kMinVideoBitrate, "clean report at 2000 ms does not raise rate");
+        bc.Update(clean, 13000); // 3000 ms clean -> raise 2000000 * 1.10 = 2200000
+        Check(bc.Bitrate() == 2'200'000, "clean reports for 3000 ms raise rate by 10%");
+        bc.Update(clean, 14000); // 1000 ms since raise (< 2000 ms limit)
+        Check(bc.Bitrate() == 2'200'000, "raise is rate-limited to once per 2000 ms");
+        bc.Update(clean, 15000); // 2000 ms since raise -> raise 2200000 * 1.10 = 2420000
+        Check(bc.Bitrate() == 2'420'000, "raise after 2000 ms increases rate again");
+
+        // Broken clean streak resets 3000 ms requirement
+        StreamStats mild_loss{};
+        mild_loss.chunks_expected = 100;
+        mild_loss.chunks_received = 98; // 2% loss: between 1% and 5% -> not clean, breaks streak
+        mild_loss.frames_lost = 0;
+        bc.Update(mild_loss, 16000);
+        Check(bc.Bitrate() == 2'420'000, "mild loss does not drop rate");
+        bc.Update(clean, 17000); // new streak starts at 17000
+        bc.Update(clean, 19000); // 2000 ms clean
+        Check(bc.Bitrate() == 2'420'000, "broken streak must wait full 3000 ms before raising");
+        bc.Update(clean, 20000); // 3000 ms clean -> raise 2420000 * 1.10 = 2662000
+        Check(bc.Bitrate() == 2'662'000, "clean for 3000 ms after break raises rate");
+
+        // Upper clamp holds at kMaxVideoBitrate (8,000,000)
+        uint32_t t = 22000;
+        for (int i = 0; i < 20; ++i) {
+            bc.Update(clean, t);
+            t += 2000;
+        }
+        Check(bc.Bitrate() == kMaxVideoBitrate, "bitrate clamps to kMaxVideoBitrate");
+    }
+
     std::puts("PASS: stream packet framing, chunking, frame reassembly, Opus audio and NV12 conversion");
     return 0;
 }

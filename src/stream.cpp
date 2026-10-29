@@ -147,6 +147,10 @@ struct Host {
     uint32_t frame_id = 0;
 
     AudioEncoder audio;
+    std::atomic<uint32_t> video_bitrate{kVideoBitrate};
+    std::atomic<bool> bitrate_changed{false};
+    BitrateController bitrate_ctrl{kVideoBitrate};
+    uint32_t last_bitrate_log_ms = 0;
 };
 Host g_host;
 
@@ -192,6 +196,10 @@ void HostNetwork() {
                     g_host.pad = {};
                     g_host.connected.store(true, std::memory_order_release);
                     g_host.force_keyframe.store(true, std::memory_order_release);
+                    g_host.bitrate_ctrl = BitrateController(kVideoBitrate);
+                    g_host.video_bitrate.store(kVideoBitrate, std::memory_order_release);
+                    g_host.bitrate_changed.store(true, std::memory_order_release);
+                    g_host.last_bitrate_log_ms = 0;
                     LOGI("stream: Player 2 connected from %s", AddressText(from).c_str());
                 }
                 g_host.last_seen = now;
@@ -203,6 +211,23 @@ void HostNetwork() {
             } else if (type == PacketType::KeyframeRequest && from_peer) {
                 g_host.force_keyframe.store(true, std::memory_order_release);
                 g_host.last_seen = now;
+            } else if (type == PacketType::Stats && from_peer && header.size == sizeof(StreamStats)) {
+                StreamStats stats{};
+                std::memcpy(&stats, payload, sizeof(stats));
+                g_host.last_seen = now;
+                const uint32_t old_rate = g_host.video_bitrate.load(std::memory_order_acquire);
+                const uint32_t new_rate = g_host.bitrate_ctrl.Update(stats, now);
+                if (new_rate != old_rate) {
+                    g_host.video_bitrate.store(new_rate, std::memory_order_release);
+                    g_host.bitrate_changed.store(true, std::memory_order_release);
+                    if (g_host.last_bitrate_log_ms == 0 || now - g_host.last_bitrate_log_ms >= 5000) {
+                        const double loss = (stats.chunks_expected > 0 && stats.chunks_received <= stats.chunks_expected)
+                            ? 100.0 * (1.0 - double(stats.chunks_received) / double(stats.chunks_expected))
+                            : 0.0;
+                        LOGI("stream: video bitrate %u kbps (loss %.1f%%)", new_rate / 1000, loss);
+                        g_host.last_bitrate_log_ms = now;
+                    }
+                }
             } else if (type == PacketType::Bye && from_peer) {
                 guard.unlock();
                 HostDisconnect("left");
@@ -221,8 +246,12 @@ void HostEncoder() {
     ComScope com(COINIT_MULTITHREADED);
     const bool media = StartMediaFoundation();
     VideoEncoder encoder;
-    std::vector<uint8_t> pixels, nv12, encoded;
+    encoder.SetBitrate(g_host.video_bitrate.load(std::memory_order_acquire));
+    std::vector<uint8_t> pixels, nv12, encoded, parity;
     while (g_host.running.load(std::memory_order_acquire)) {
+        if (g_host.bitrate_changed.exchange(false, std::memory_order_acq_rel)) {
+            encoder.SetBitrate(g_host.video_bitrate.load(std::memory_order_acquire));
+        }
         uint32_t w = 0, h = 0;
         {
             std::unique_lock guard(g_host.frame_lock);
@@ -251,11 +280,44 @@ void HostEncoder() {
         chunk.total = uint32_t(encoded.size());
         chunk.count = ChunkCount(encoded.size());
         chunk.flags = key ? kVideoFlagKeyframe : 0;
-        for (uint16_t i = 0; i < chunk.count; ++i) {
-            chunk.index = i;
-            const size_t offset = size_t(i) * kMaxChunk;
-            const size_t size = std::min(kMaxChunk, encoded.size() - offset);
-            HostSend(BuildPacket(PacketType::Video, g_host.seq++, &chunk, sizeof(chunk), encoded.data() + offset, size));
+        // fec_count is 8 bits; a frame too large for it goes without parity.
+        const uint32_t groups = (uint32_t(chunk.count) + kFecGroup - 1) / kFecGroup;
+        chunk.fec_group = groups <= 255 ? kFecGroup : 0;
+        chunk.fec_count = groups <= 255 ? uint8_t(groups) : 0;
+        if (chunk.fec_group) BuildParity(encoded.data(), encoded.size(), chunk.count, kFecGroup, parity);
+
+        const uint16_t total_chunks = chunk.count + chunk.fec_count;
+        const size_t total_bytes = encoded.size() + size_t(chunk.fec_count) * kMaxChunk;
+        const uint32_t current_rate = g_host.video_bitrate.load(std::memory_order_acquire);
+        const uint64_t rate_2x = uint64_t(current_rate) * 2;
+        const uint64_t target_duration_us = (rate_2x > 0 && total_chunks > 1)
+            ? std::min<uint64_t>(uint64_t(total_bytes) * 8 * 1'000'000 / rate_2x, 12'000)
+            : 0;
+
+        const auto start_time = std::chrono::steady_clock::now();
+        for (uint16_t idx = 0; idx < total_chunks; ++idx) {
+            if (idx > 0 && target_duration_us > 0) {
+                const auto target_time = start_time + std::chrono::microseconds(uint64_t(idx) * target_duration_us / (total_chunks - 1));
+                const auto now = std::chrono::steady_clock::now();
+                if (target_time > now) {
+                    const auto rem_us = std::chrono::duration_cast<std::chrono::microseconds>(target_time - now).count();
+                    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(now - start_time).count();
+                    if (elapsed_us < 12'000) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(rem_us));
+                    }
+                }
+            }
+            if (idx < chunk.count) {
+                chunk.index = idx;
+                const size_t offset = size_t(idx) * kMaxChunk;
+                const size_t size = std::min(kMaxChunk, encoded.size() - offset);
+                HostSend(BuildPacket(PacketType::Video, g_host.seq++, &chunk, sizeof(chunk), encoded.data() + offset, size));
+            } else {
+                const uint16_t g = idx - chunk.count;
+                chunk.index = idx;
+                const size_t offset = size_t(g) * kMaxChunk;
+                HostSend(BuildPacket(PacketType::Video, g_host.seq++, &chunk, sizeof(chunk), parity.data() + offset, kMaxChunk));
+            }
         }
     }
 }
@@ -355,6 +417,12 @@ void ClientNetwork(Client& c) {
     bool waiting_keyframe = true;
     bool has_frame = false;
     uint32_t last_frame = 0, last_request = 0;
+    uint32_t last_stats = NowMs();
+    StreamStats stats{};
+    uint32_t last_assembler_dropped = 0;
+    uint32_t last_assembler_recovered = 0;
+    uint32_t last_seen_frame_id = 0;
+    bool has_seen_frame_id = false;
     auto request_keyframe = [&] {
         const uint32_t now = NowMs();
         if (c.connected.load(std::memory_order_acquire) && now - last_request >= kKeyframeRequestMs) {
@@ -369,7 +437,15 @@ void ClientNetwork(Client& c) {
                                reinterpret_cast<sockaddr*>(&from), &from_len);
         Header header;
         const uint8_t* payload = nullptr;
+        const uint32_t now = NowMs();
         if (waiting_keyframe) request_keyframe();
+        if (c.connected.load(std::memory_order_acquire) &&
+            now - last_stats >= kStatsIntervalMs &&
+            (!assembler.IsActive() || now - last_stats >= kStatsIntervalMs + 50)) {
+            ClientSend(c, PacketType::Stats, 0, &stats, sizeof(stats));
+            stats = StreamStats{};
+            last_stats = now;
+        }
         if (n <= 0 || !SameAddress(from, c.host) || !ParsePacket(buffer.data(), size_t(n), header, payload)) continue;
         c.last_packet.store(NowMs(), std::memory_order_release);
         const auto type = PacketType(header.type);
@@ -379,6 +455,11 @@ void ClientNetwork(Client& c) {
                 waiting_keyframe = true;
                 has_frame = false;
                 last_request = NowMs() - kKeyframeRequestMs;
+                last_stats = NowMs();
+                stats = StreamStats{};
+                last_assembler_dropped = assembler.Dropped();
+                last_assembler_recovered = assembler.Recovered();
+                has_seen_frame_id = false;
                 LOGI("stream: connected to host %s", AddressText(c.host).c_str());
                 PostMessageW(c.window, WM_APP + 1, 0, 0);
             }
@@ -386,7 +467,35 @@ void ClientNetwork(Client& c) {
             VideoChunk chunk;
             std::memcpy(&chunk, payload, sizeof(chunk));
             if (chunk.codec != kVideoCodecH264 || !media) continue;
-            if (!assembler.Add(chunk, payload + sizeof(chunk), header.size - sizeof(chunk), encoded)) continue;
+
+            stats.chunks_received++;
+            if (!has_seen_frame_id || int32_t(chunk.frame - last_seen_frame_id) > 0) {
+                if (has_seen_frame_id) {
+                    const int32_t diff = int32_t(chunk.frame - last_seen_frame_id);
+                    if (diff > 1) stats.frames_lost += uint32_t(diff - 1);
+                }
+                stats.chunks_expected += uint32_t(chunk.count + chunk.fec_count);
+                last_seen_frame_id = chunk.frame;
+                has_seen_frame_id = true;
+            }
+
+            // Ignore parity chunks of frames already complete.
+            if (chunk.index >= chunk.count && assembler.IsFrameComplete(chunk.frame)) {
+                continue;
+            }
+
+            const bool complete = assembler.Add(chunk, payload + sizeof(chunk), header.size - sizeof(chunk), encoded);
+            const uint32_t cur_dropped = assembler.Dropped();
+            if (cur_dropped > last_assembler_dropped) {
+                stats.frames_lost += (cur_dropped - last_assembler_dropped);
+                last_assembler_dropped = cur_dropped;
+            }
+            const uint32_t cur_recovered = assembler.Recovered();
+            if (cur_recovered > last_assembler_recovered) {
+                stats.frames_recovered += (cur_recovered - last_assembler_recovered);
+                last_assembler_recovered = cur_recovered;
+            }
+            if (!complete) continue;
             const bool key = (chunk.flags & kVideoFlagKeyframe) != 0;
             // A gap in frame ids means a lost frame that later frames reference.
             if (has_frame && chunk.frame != last_frame + 1) waiting_keyframe = true;
@@ -421,6 +530,8 @@ void ClientNetwork(Client& c) {
             c.audio.Reset();
             waiting_keyframe = true;
             has_frame = false;
+            has_seen_frame_id = false;
+            stats = StreamStats{};
             if (c.connected.exchange(false)) LOGI("stream: host closed the session");
             PostMessageW(c.window, WM_APP + 1, 0, 0);
         }

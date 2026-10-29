@@ -2,6 +2,7 @@
 
 #include <opus.h>
 
+#include <algorithm>
 #include <cstring>
 
 namespace openshao::stream {
@@ -207,11 +208,76 @@ uint16_t ChunkCount(size_t total) {
     return uint16_t((total + kMaxChunk - 1) / kMaxChunk);
 }
 
+void BuildParity(const uint8_t* data, size_t total, uint16_t count, uint8_t group, std::vector<uint8_t>& parity) {
+    if (!data || !total || !count || !group) {
+        parity.clear();
+        return;
+    }
+    const uint16_t num_groups = uint16_t((count + group - 1) / group);
+    parity.assign(size_t(num_groups) * kMaxChunk, 0);
+    for (uint16_t g = 0; g < num_groups; ++g) {
+        uint8_t* dst = parity.data() + size_t(g) * kMaxChunk;
+        const size_t start = size_t(g) * group;
+        const size_t end = std::min(size_t(start + group), size_t(count));
+        for (size_t i = start; i < end; ++i) {
+            const size_t offset = i * kMaxChunk;
+            const size_t chunk_size = (offset < total) ? std::min(kMaxChunk, total - offset) : 0;
+            const uint8_t* src = data + offset;
+            for (size_t b = 0; b < chunk_size; ++b) {
+                dst[b] ^= src[b];
+            }
+        }
+    }
+}
+
+void FrameAssembler::TryRecover(uint8_t g) {
+    if (!fec_group_ || g >= fec_count_ || !have_parity_[g]) return;
+    const size_t start = size_t(g) * fec_group_;
+    const size_t end = std::min(start + fec_group_, size_t(count_));
+    size_t missing_count = 0;
+    size_t missing_idx = 0;
+    for (size_t i = start; i < end; ++i) {
+        if (!have_[i]) {
+            ++missing_count;
+            missing_idx = i;
+        }
+    }
+    if (missing_count != 1) return;
+
+    std::array<uint8_t, kMaxChunk> rebuilt{};
+    std::memcpy(rebuilt.data(), parity_data_.data() + size_t(g) * kMaxChunk, kMaxChunk);
+    for (size_t i = start; i < end; ++i) {
+        if (i == missing_idx) continue;
+        const size_t offset_i = i * kMaxChunk;
+        const size_t len_i = (i + 1 == count_) ? total_ - offset_i : kMaxChunk;
+        const uint8_t* src = data_.data() + offset_i;
+        for (size_t b = 0; b < len_i; ++b) {
+            rebuilt[b] ^= src[b];
+        }
+    }
+    const size_t missing_offset = missing_idx * kMaxChunk;
+    const size_t missing_len = (missing_idx + 1 == count_) ? total_ - missing_offset : kMaxChunk;
+    std::memcpy(data_.data() + missing_offset, rebuilt.data(), missing_len);
+    have_[missing_idx] = true;
+    ++received_;
+    recovered_this_frame_ = true;
+}
+
 bool FrameAssembler::Add(const VideoChunk& chunk, const uint8_t* data, size_t size, std::vector<uint8_t>& complete) {
-    if (!chunk.count || chunk.index >= chunk.count || chunk.count != ChunkCount(chunk.total)) return false;
-    const size_t offset = size_t(chunk.index) * kMaxChunk;
-    const size_t expected = chunk.index + 1u == chunk.count ? chunk.total - offset : kMaxChunk;
-    if (size != expected) return false;
+    if (!chunk.count || chunk.count != ChunkCount(chunk.total) || !data) return false;
+    const uint16_t expected_fec = chunk.fec_group ? uint16_t((chunk.count + chunk.fec_group - 1) / chunk.fec_group) : 0;
+    if (chunk.fec_count != expected_fec) return false;
+    if (chunk.index >= chunk.count + chunk.fec_count) return false;
+
+    const bool is_parity = chunk.index >= chunk.count;
+    if (!is_parity) {
+        const size_t offset = size_t(chunk.index) * kMaxChunk;
+        const size_t expected = chunk.index + 1u == chunk.count ? chunk.total - offset : kMaxChunk;
+        if (size != expected) return false;
+    } else {
+        if (size != kMaxChunk) return false;
+    }
+
     // Frame ids wrap; anything not newer than the last shown frame is a late duplicate.
     if (has_complete_ && int32_t(chunk.frame - last_complete_) <= 0) return false;
     if (!active_ || chunk.frame != frame_) {
@@ -221,19 +287,79 @@ bool FrameAssembler::Add(const VideoChunk& chunk, const uint8_t* data, size_t si
         frame_ = chunk.frame;
         total_ = chunk.total;
         count_ = chunk.count;
+        fec_group_ = chunk.fec_group;
+        fec_count_ = chunk.fec_count;
         received_ = 0;
+        recovered_this_frame_ = false;
         data_.assign(total_, 0);
         have_.assign(count_, false);
+        have_parity_.assign(fec_count_, false);
+        parity_data_.assign(size_t(fec_count_) * kMaxChunk, 0);
     }
-    if (chunk.total != total_ || chunk.count != count_ || have_[chunk.index]) return false;
-    std::memcpy(data_.data() + offset, data, size);
-    have_[chunk.index] = true;
-    if (++received_ != count_) return false;
+    if (chunk.total != total_ || chunk.count != count_ ||
+        chunk.fec_group != fec_group_ || chunk.fec_count != fec_count_) {
+        return false;
+    }
+    if (!is_parity) {
+        if (have_[chunk.index]) return false;
+        const size_t offset = size_t(chunk.index) * kMaxChunk;
+        std::memcpy(data_.data() + offset, data, size);
+        have_[chunk.index] = true;
+        ++received_;
+        if (fec_group_ > 0) {
+            TryRecover(uint8_t(chunk.index / fec_group_));
+        }
+    } else {
+        const uint8_t g = uint8_t(chunk.index - count_);
+        if (have_parity_[g]) return false;
+        std::memcpy(parity_data_.data() + size_t(g) * kMaxChunk, data, kMaxChunk);
+        have_parity_[g] = true;
+        TryRecover(g);
+    }
+    if (received_ != count_) return false;
     complete.swap(data_);
     active_ = false;
     has_complete_ = true;
     last_complete_ = frame_;
+    if (recovered_this_frame_) ++recovered_;
     return true;
+}
+
+BitrateController::BitrateController(uint32_t start)
+    : bitrate_(std::clamp(start, kMinVideoBitrate, kMaxVideoBitrate)) {}
+
+uint32_t BitrateController::Update(const StreamStats& s, uint32_t now_ms) {
+    if (s.chunks_expected < 20) return bitrate_;
+
+    const double loss = (s.chunks_received >= s.chunks_expected)
+        ? 0.0
+        : 1.0 - double(s.chunks_received) / double(s.chunks_expected);
+
+    const bool lossy = (loss > 0.05 || s.frames_lost > 0);
+    const bool clean = (loss < 0.01 && s.frames_lost == 0);
+
+    if (lossy) {
+        clean_active_ = false;
+        if (!has_dropped_ || now_ms - last_drop_ms_ >= 1000) {
+            bitrate_ = std::clamp(uint32_t(double(bitrate_) * 0.75), kMinVideoBitrate, kMaxVideoBitrate);
+            last_drop_ms_ = now_ms;
+            has_dropped_ = true;
+        }
+    } else if (!clean) {
+        clean_active_ = false;
+    } else {
+        if (!clean_active_) {
+            clean_active_ = true;
+            clean_start_ms_ = now_ms;
+        } else if (now_ms - clean_start_ms_ >= 3000) {
+            if (!has_raised_ || now_ms - last_raise_ms_ >= 2000) {
+                bitrate_ = std::clamp(uint32_t(double(bitrate_) * 1.10), kMinVideoBitrate, kMaxVideoBitrate);
+                last_raise_ms_ = now_ms;
+                has_raised_ = true;
+            }
+        }
+    }
+    return bitrate_;
 }
 
 } // namespace openshao::stream
