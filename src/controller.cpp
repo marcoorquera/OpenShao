@@ -17,6 +17,7 @@
 #include "keyboard.h"
 #include "mouse.h"
 #include "netplay.h"
+#include "stream.h"
 #include "app/app.h"
 #include "core/input.h"
 #include "core/log.h"
@@ -48,6 +49,11 @@ bool rumble_enabled=true;
 bool multiplayer=false;
 int auto_reserved=-1, auto_keyboard=0;
 std::array<SDL_Joystick*,4> fixtures{};
+// The streamed Player 2 appears as one more SDL gamepad, so local Ko-op assigns it like a physical one.
+SDL_Joystick* remote_fixture=nullptr;
+bool IsRemote(SDL_Gamepad* pad) {
+    return remote_fixture && pad && SDL_GetGamepadID(pad)==SDL_GetJoystickID(remote_fixture);
+}
 bool Enabled() { return !openshao::options.background || openshao::options.virtual_gamepads; }
 int PhysicalPort(int port) {
     if (port<0 || port>=4 || port==auto_reserved) return -1;
@@ -76,6 +82,20 @@ void Add(SDL_JoystickID id) {
     LOGI("input: port=%d name=%s type=%s connection=%d vendor=%04X product=%04X rumble=%d",
          LogicalPort(int(it-slots.begin())),SDL_GetGamepadName(pad),SDL_GetGamepadStringForType(SDL_GetGamepadType(pad)),
          int(SDL_GetGamepadConnectionState(pad)),SDL_GetGamepadVendor(pad),SDL_GetGamepadProduct(pad),it->rumble);
+    // The streamed player is Player 2 behind the host's first gamepad, or the only gamepad.
+    const auto remote=std::find_if(slots.begin(),slots.end(),[](const Slot& s){return IsRemote(s.device);});
+    if (remote==slots.end()) return;
+    std::array<Slot,4> order{};
+    size_t count=0;
+    for (auto& s:slots) if (s.device && &s!=&*remote) order[count++]=s;
+    const size_t target=std::min<size_t>(1,count);
+    if (size_t(remote-slots.begin())==target && std::all_of(slots.begin(),slots.begin()+long(count+1),
+                                                            [](const Slot& s){return s.device!=nullptr;})) return;
+    const Slot moved=*remote;
+    for (size_t i=count;i>target;--i) order[i]=order[i-1];
+    order[target]=moved;
+    slots=order;
+    LOGI("input: remote Player 2 uses port=%d",LogicalPort(int(target)));
 }
 void Remove(SDL_JoystickID id) {
     for (auto& s:slots) if (s.device && SDL_GetGamepadID(s.device)==id) {
@@ -100,6 +120,34 @@ void DetachFixture(unsigned index) {
     if (!fixtures[index]) return;
     const auto id=SDL_GetJoystickID(fixtures[index]);
     SDL_CloseJoystick(fixtures[index]);SDL_DetachVirtualJoystick(id);fixtures[index]=nullptr;
+}
+void DetachRemote() {
+    if (!remote_fixture) return;
+    const auto id=SDL_GetJoystickID(remote_fixture);
+    SDL_CloseJoystick(remote_fixture);SDL_DetachVirtualJoystick(id);remote_fixture=nullptr;
+    LOGI("input: remote Player 2 gamepad removed");
+}
+void SyncRemote() {
+    openshao::stream::RemotePad remote{};
+    if (!openshao::stream::RemotePadState(remote)) { DetachRemote(); return; }
+    if (!remote_fixture) {
+        SDL_VirtualJoystickDesc desc; SDL_INIT_INTERFACE(&desc);
+        desc.type=SDL_JOYSTICK_TYPE_GAMEPAD;desc.naxes=SDL_GAMEPAD_AXIS_COUNT;desc.nbuttons=SDL_GAMEPAD_BUTTON_COUNT;
+        desc.axis_mask=(1u<<SDL_GAMEPAD_AXIS_COUNT)-1;desc.button_mask=(1u<<SDL_GAMEPAD_BUTTON_COUNT)-1;
+        desc.name="OpenShao remote Player 2";
+        const auto id=SDL_AttachVirtualJoystick(&desc);
+        remote_fixture=id?SDL_OpenJoystick(id):nullptr;
+        if (!remote_fixture) {if(id)SDL_DetachVirtualJoystick(id);LOG_FIRST(1,"input: cannot create remote Player 2 gamepad");return;}
+        LOGI("input: remote Player 2 gamepad added");
+    }
+    for (int b=0;b<SDL_GAMEPAD_BUTTON_COUNT && b<32;++b)
+        SDL_SetJoystickVirtualButton(remote_fixture,b,((remote.buttons>>b)&1u)!=0);
+    for (int a=0;a<SDL_GAMEPAD_AXIS_COUNT && a<int(remote.axes.size());++a) {
+        int value=remote.axes[size_t(a)];
+        // Virtual trigger axes use the full joystick range; rest is -32768.
+        if (a==SDL_GAMEPAD_AXIS_LEFT_TRIGGER || a==SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) value=std::clamp(value*2-32768,-32768,32767);
+        SDL_SetJoystickVirtualAxis(remote_fixture,a,Sint16(value));
+    }
 }
 }
 namespace openshao::controller {
@@ -195,8 +243,9 @@ bool HasRumble(int port) {
 bool RumbleEnabled(){std::lock_guard guard(lock);return rumble_enabled;}
 void Update() {
     if (!Enabled() || !initialized || GetCurrentThreadId()!=owner_thread) return;
-    SDL_PumpEvents();
     std::lock_guard guard(lock);
+    SyncRemote();
+    SDL_PumpEvents();
     SDL_Event event;
     while (SDL_PeepEvents(&event,1,SDL_GETEVENT,SDL_EVENT_GAMEPAD_ADDED,SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED)==1) {
         if (event.type==SDL_EVENT_GAMEPAD_ADDED) Add(event.gdevice.which);
@@ -221,7 +270,7 @@ void Update() {
         const auto previous=s.state;s.state={}; auto* pad=s.device;
         if (!pad || !SDL_GamepadConnected(pad)) continue;
         auto& p=s.state; p.connected=true;
-        if (focused || openshao::netplay::IsLoopbackSession()) {
+        if (focused || openshao::netplay::IsLoopbackSession() || IsRemote(pad)) {
             std::string raw_source;uint32_t raw_buttons=0;
             for(int button=0;button<SDL_GAMEPAD_BUTTON_COUNT;++button)if(SDL_GetGamepadButton(pad,SDL_GamepadButton(button))) {
                 if(raw_source.empty())if(const auto* name=SDL_GetGamepadStringForButton(SDL_GamepadButton(button)))raw_source=name;
@@ -294,6 +343,7 @@ void Shutdown() {
         SDL_CloseGamepad(s.device); s={};
     }
     for (unsigned i=0;i<fixtures.size();++i) DetachFixture(i);
+    DetachRemote();
     SDL_QuitSubSystem(SDL_INIT_GAMEPAD); initialized=false; game_window=nullptr;
     multiplayer=false;auto_reserved=-1;auto_keyboard=0;last_device_scan=0;
 }

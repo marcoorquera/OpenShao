@@ -30,6 +30,10 @@ struct Options {
     std::string netplay_address = "127.0.0.1";
     uint16_t netplay_port = 27886;
     unsigned netplay_delay = 1;
+    bool stream_host = false;
+    bool stream_join = false;
+    std::string stream_address = "127.0.0.1";
+    uint16_t stream_port = 27886;
     std::filesystem::path game;
     std::filesystem::path disc;
     std::filesystem::path save_dir;
