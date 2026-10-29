@@ -91,6 +91,7 @@ bool StartHost(uint16_t port, std::string& error);
 void StopHost();
 bool HostActive();
 bool ClientConnected();
+std::string PublicEndpoint();
 bool RemotePadState(RemotePad& pad);
 bool WantsVideo();
 void SubmitVideo(const uint8_t* bgra, uint32_t width, uint32_t height, uint32_t pitch);

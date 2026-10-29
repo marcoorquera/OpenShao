@@ -1,4 +1,5 @@
 #include "stream.h"
+#include "stream_upnp.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -43,6 +44,7 @@ bool StartHost(uint16_t, std::string& error) {
 void StopHost() {}
 bool HostActive() { return false; }
 bool ClientConnected() { return false; }
+std::string PublicEndpoint() { return {}; }
 bool RemotePadState(RemotePad&) { return false; }
 bool WantsVideo() { return false; }
 void SubmitVideo(const uint8_t*, uint32_t, uint32_t, uint32_t) {}
@@ -562,11 +564,13 @@ bool StartHost(uint16_t port, std::string& error) {
     g_host.running.store(true);
     g_host.net = std::thread(HostNetwork);
     g_host.encoder = std::thread(HostEncoder);
+    upnp::Start(port);
     LOGI("stream: hosting on UDP port %u, waiting for Player 2", unsigned(port));
     return true;
 }
 
 void StopHost() {
+    upnp::Stop();
     if (!g_host.running.exchange(false)) return;
     if (g_host.connected.load()) {
         const auto bye = BuildPacket(PacketType::Bye, g_host.seq++, nullptr, 0);
@@ -583,6 +587,8 @@ void StopHost() {
 bool HostActive() { return g_host.running.load(std::memory_order_acquire); }
 
 bool ClientConnected() { return g_host.connected.load(std::memory_order_acquire); }
+
+std::string PublicEndpoint() { return upnp::ExternalEndpoint(); }
 
 bool RemotePadState(RemotePad& pad) {
     std::lock_guard guard(g_host.peer_lock);
