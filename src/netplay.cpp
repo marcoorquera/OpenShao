@@ -120,6 +120,11 @@ uint32_t GenerateSeed() {
     return seed ? seed : 0x5348414Fu;
 }
 
+int64_t SteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 Session& GlobalSession() {
     static Session instance;
     return instance;
@@ -500,6 +505,8 @@ bool Session::Start(const Config& config, std::string& error) {
     }
     synced_pads_[0] = neutral;
     synced_pads_[1] = neutral;
+    in_advance_.store(false, std::memory_order_release);
+    last_advance_ms_.store(SteadyMs(), std::memory_order_release);
     active_.store(true, std::memory_order_release);
     return true;
 }
@@ -528,6 +535,14 @@ void Session::Stop() {
 bool Session::AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash, bool in_gameplay) {
     std::lock_guard guard(mutex_);
     if (!active_.load(std::memory_order_relaxed)) return false;
+    in_advance_.store(true, std::memory_order_release);
+    struct AdvanceScope {
+        Session& s;
+        ~AdvanceScope() {
+            s.last_advance_ms_.store(SteadyMs(), std::memory_order_release);
+            s.in_advance_.store(false, std::memory_order_release);
+        }
+    } advance_scope{*this};
 
     const uint32_t initial_frame = current_frame_.load(std::memory_order_relaxed);
     uint32_t frame = initial_frame;
@@ -641,6 +656,25 @@ bool Session::AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_has
         clock_frame_.fetch_add(1, std::memory_order_release);
     }
     current_frame_.store(frame + 1, std::memory_order_release);
+    return true;
+}
+
+// Movies and loading screens wait for guest time to pass before they present again,
+// and guest time otherwise advances only on presented frames. Without a completed
+// lockstep frame for a while, advance the guest clocks once per real vertical blank.
+bool Session::TickIdleClock() {
+    if (!active_.load(std::memory_order_acquire) || in_advance_.load(std::memory_order_acquire)) return false;
+    if (SteadyMs() - last_advance_ms_.load(std::memory_order_acquire) < int64_t(kIdleClockThresholdMs)) {
+        if (idle_ticks_.exchange(0, std::memory_order_acq_rel)) {
+            LOGI("netplay: lockstep resumed at frame %u", current_frame_.load(std::memory_order_acquire));
+        }
+        return false;
+    }
+    if (idle_ticks_.fetch_add(1, std::memory_order_acq_rel) == 0) {
+        LOGI("netplay: no lockstep frame at frame %u, guest clocks follow vertical blank",
+             current_frame_.load(std::memory_order_acquire));
+    }
+    clock_frame_.fetch_add(1, std::memory_order_release);
     return true;
 }
 
@@ -770,6 +804,10 @@ bool AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash, bool i
 
 input::Pad GetSyncedPad(int port) {
     return GlobalSession().GetSyncedPad(port);
+}
+
+bool TickIdleClock() {
+    return GlobalSession().TickIdleClock();
 }
 
 } // namespace openshao::netplay

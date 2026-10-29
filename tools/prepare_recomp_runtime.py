@@ -91,6 +91,12 @@ def main():
         '    app::Load();\n    { std::string error; if (!openshao::restart::ContinueStartup(error)) { LOGE("Language restart: %s", error.c_str()); return 8; } }')
     text = replace_once(text, 'bool splash = !openshao::options.background && app::OpenSplash();',
         'bool splash = !openshao::options.background && !openshao::options.resume_main_menu && app::OpenSplash();')
+    # The streamed Player 2 only shows the host's picture; it needs no game files.
+    text = '#include "stream.h"\n' + text
+    text = replace_once(text, '    openshao::StartWatchdog();\n    if (app::kGame.init) app::kGame.init();',
+        '    openshao::StartWatchdog();\n'
+        '    if (openshao::options.stream_join) return openshao::stream::RunClient(openshao::options.stream_address, openshao::options.stream_port);\n'
+        '    if (app::kGame.init) app::kGame.init();')
     (args.out / "main.cpp").write_text(text, encoding="utf-8")
     settings = (args.sdk / "runtime/app/settings.cpp").read_text(encoding="utf-8")
     settings = '#include "launcher.h"\n#include "runtime_paths.h"\n' + settings
@@ -311,7 +317,7 @@ uint32_t OpenOnDisc(''')
         '    else if (t.disc) FillNetworkInfo(a[1], *t.entry);')
     (args.out / "files.cpp").write_text(files, encoding="utf-8")
     boot = (args.sdk / "runtime/kernel/boot.cpp").read_text(encoding="utf-8")
-    boot = '#include "host.h"\n#include "netplay.h"\n#include "runtime_paths.h"\n#include "language_pack.h"\n#include "mods/runtime.h"\n' + boot
+    boot = '#include "host.h"\n#include "netplay.h"\n#include "stream.h"\n#include "runtime_paths.h"\n#include "language_pack.h"\n#include "mods/runtime.h"\n' + boot
     boot = replace_once(boot, '    if (app::kGame.loaded) app::kGame.loaded();',
         '    std::string language_error;\n'
         '    if (!openshao::language::ApplyFonts(std::span<uint8_t>(g_base, X86ImageEnd), language_error)) {\n'
@@ -332,6 +338,7 @@ uint32_t OpenOnDisc(''')
         'return (openshao::paths::Cache() / "display.bin").string();')
     boot = replace_once(boot, '    std::_Exit(code);',
         '    openshao::netplay::Stop();\n'
+        '    openshao::stream::StopHost();\n'
         '    if (code) openshao::paths::ReportError(L"The game stopped with error code " + std::to_wstring(code) + L".");\n    std::_Exit(code);')
     boot = replace_once(boot, "void Relaunch(const char* exe) {", "void Relaunch(const char* exe) {\n    if (openshao::options.background) { LOGE(\"Relaunch refused during isolated background test\"); Shutdown(50); }")
     (args.out / "boot.cpp").write_text(boot, encoding="utf-8")
@@ -420,10 +427,10 @@ uint32_t OpenOnDisc(''')
     xapi += '\n#include "controller_mode.inl"\n'
     (args.out / "xapi.cpp").write_text(xapi, encoding="utf-8")
     audio = (args.sdk / "runtime/audio/xaudio2.cpp").read_text(encoding="utf-8")
-    audio = '#include "host.h"\n#include "launcher.h"\n#include "scorpion_preview_audio.h"\n' + audio
+    audio = '#include "host.h"\n#include "launcher.h"\n#include "scorpion_preview_audio.h"\n#include "stream.h"\n' + audio
     audio = replace_once(audio, "        voice->Start();", "        master->SetVolume(openshao::options.background ? 0.0f : openshao::launcher::AudioGain());\n        voice->Start();")
     audio = replace_once(audio, "            render(b, kFrames);", "            master->SetVolume(openshao::options.background ? 0.0f : openshao::launcher::AudioGain());\n            render(b, kFrames);")
-    audio = replace_once(audio, "            render(b, kFrames);", "            render(b, kFrames);\n            openshao::scorpion::audio_preview::Mix(b, kFrames);")
+    audio = replace_once(audio, "            render(b, kFrames);", "            render(b, kFrames);\n            openshao::scorpion::audio_preview::Mix(b, kFrames);\n            openshao::stream::SubmitAudio(b, kFrames, kRate);")
     (args.out / "xaudio2.cpp").write_text(audio, encoding="utf-8")
     d3d = (args.sdk / "runtime/xdk/d3d8.cpp").read_text(encoding="utf-8")
     d3d = '#include "aspect_ratio.h"\n#include "controller.h"\n#include "netplay.h"\n#include "sfd_lock_compat.h"\n#include "sfd_filter_compat.h"\n#include "vblank_compat.h"\n#include <array>\nnamespace kernel { void SyncNetplayKernelClocks(); }\nstatic std::array<uint32_t, 13> g_openshao_present{};\n' + d3d
@@ -438,6 +445,8 @@ uint32_t OpenOnDisc(''')
         '    }')
     d3d = replace_once(d3d, '// what the library\'s vertical blank interrupt leaves for the title: count, event, callback',
         'static openshao::VBlankClock g_openshao_vblank;\n'
+        '// Netplay vertical blanks that passed while no lockstep frame completed.\n'
+        'static std::atomic<uint32_t> g_openshao_idle_vblanks{0};\n'
         '// what the library\'s vertical blank interrupt leaves for the title: count, event, callback')
     d3d = replace_once(d3d,
         '        uint32_t count = Dev(XDK_CDevice_VBlankCount) + 1, swaps = Dev(kDevSwapCount);\n'
@@ -453,8 +462,14 @@ uint32_t OpenOnDisc(''')
         '        }\n'
         '        shown = swaps;',
         '        uint32_t swaps = Dev(kDevSwapCount);\n'
-        '        if (!openshao::netplay::IsActive() || swaps != shown) {\n'
-        '            uint32_t count = openshao::netplay::IsActive() ? swaps : (Dev(XDK_CDevice_VBlankCount) + 1);\n'
+        '        const bool net = openshao::netplay::IsActive();\n'
+        '        const bool idle = net && openshao::netplay::TickIdleClock();\n'
+        '        if (idle) {\n'
+        '            g_openshao_idle_vblanks.fetch_add(1);\n'
+        '            kernel::SyncNetplayKernelClocks();\n'
+        '        }\n'
+        '        if (!net || idle || swaps != shown) {\n'
+        '            uint32_t count = net ? swaps + g_openshao_idle_vblanks.load() : (Dev(XDK_CDevice_VBlankCount) + 1);\n'
         '            SetDev(XDK_CDevice_VBlankCount, count);\n'
         '            if (uint32_t callback = Dev(XDK_CDevice_VBlankCallback)) {\n'
         '                W32(info, count);\n'
@@ -484,19 +499,18 @@ uint32_t OpenOnDisc(''')
         '    g_presents++;\n'
         '    if (openshao::netplay::IsActive()) {\n'
         '        const uint32_t p1 = R32(0x64D230), p2 = R32(0x64D23C);\n'
-        '        const bool wad_loading = R32(0x695304) != 0;\n'
-        '        if (!wad_loading) {\n'
-        '            const bool in_gameplay = p1 != 0 && mem::IsCommitted(p1 + 0x88) && R32(p1 + 0x68) == 1;\n'
-        '            uint32_t state_hash = 0;\n'
-        '            if ((openshao::netplay::CurrentFrame() % 60u) == 0u) {\n'
-        '                const uint32_t p1_x = in_gameplay ? R32(p1 + 0x80) : 0u;\n'
-        '                const uint32_t p2_x = (in_gameplay && p2 && mem::IsCommitted(p2 + 0x88)) ? R32(p2 + 0x80) : 0u;\n'
-        '                state_hash = (R32(0x6C9308) * 2654435761u) ^ R32(0x598430 + 0x38) ^ R32(0x505970) ^ p1_x ^ p2_x ^ 0x5348414Fu;\n'
-        '                if (!state_hash) state_hash = 1;\n'
-        '            }\n'
-        '            openshao::netplay::AdvanceFrame(openshao::controller::PollLocal(), state_hash, in_gameplay);\n'
-        '            kernel::SyncNetplayKernelClocks();\n'
+        '        // 0x695304 stays set through the whole frontend, so it cannot gate lockstep frames.\n'
+        '        // The gameplay barrier in AdvanceFrame aligns peers that finish loading at different times.\n'
+        '        const bool in_gameplay = p1 != 0 && mem::IsCommitted(p1 + 0x88) && R32(p1 + 0x68) == 1;\n'
+        '        uint32_t state_hash = 0;\n'
+        '        if ((openshao::netplay::CurrentFrame() % 60u) == 0u) {\n'
+        '            const uint32_t p1_x = in_gameplay ? R32(p1 + 0x80) : 0u;\n'
+        '            const uint32_t p2_x = (in_gameplay && p2 && mem::IsCommitted(p2 + 0x88)) ? R32(p2 + 0x80) : 0u;\n'
+        '            state_hash = (R32(0x6C9308) * 2654435761u) ^ R32(0x598430 + 0x38) ^ R32(0x505970) ^ p1_x ^ p2_x ^ 0x5348414Fu;\n'
+        '            if (!state_hash) state_hash = 1;\n'
         '        }\n'
+        '        openshao::netplay::AdvanceFrame(openshao::controller::PollLocal(), state_hash, in_gameplay);\n'
+        '        kernel::SyncNetplayKernelClocks();\n'
         '    }\n'
         '    { static uint64_t last_tick=0; static uint32_t last_swap=0;\n'
         '      const uint64_t tick=GetTickCount64();\n'
@@ -508,7 +522,7 @@ uint32_t OpenOnDisc(''')
         '      } }')
     d3d = replace_once(d3d,
         '    uint32_t n = Dev(kDevSwapCount) + 1;\n    SetDev(kDevSwapCount, n);',
-        '    uint32_t n = Dev(kDevSwapCount) + 1;\n    SetDev(kDevSwapCount, n);\n    if (openshao::netplay::IsActive() && kVBlank) SetDev(XDK_CDevice_VBlankCount, n);')
+        '    uint32_t n = Dev(kDevSwapCount) + 1;\n    SetDev(kDevSwapCount, n);\n    if (openshao::netplay::IsActive() && kVBlank) SetDev(XDK_CDevice_VBlankCount, n + g_openshao_idle_vblanks.load());')
     d3d = replace_once(d3d, 'if (!(handle & 1) && (handle & 0xE) == 4) LOG_FIRST(1, "d3d: pretransformed immediate mode vertices are not supported");', 'if (!(handle & 1) && (handle & 0xE) == 4) LOG_FIRST(1, "openshao d3d: screen-coordinate immediate vertices");')
     # The original SetRenderTarget reaches SetViewport through
     # D3D_CommonSetMultiSampleModeAndScale. Match SetViewport's clipping reset.
@@ -804,6 +818,72 @@ uint32_t OpenOnDisc(''')
         '        if (std::getenv("OPENSHAO_CAPTURE_NATIVE_PIXELS"))\n'
         '            CapSave({.res=f->res.Get(), .state=&f->state, .fmt=f->fmt, .w=f->w, .h=f->h, .mul=f->range}, "final_native");\n'
         '    }')
+    # LAN streaming: copy the guest-sized frame into a readback buffer of the frame slot and
+    # hand it over once that slot's fence completes, so the capture never stalls the GPU.
+    backend = '#include "stream.h"\n' + backend
+    backend = replace_once(backend, '    Frame frames_[kFrames];',
+        '    Frame frames_[kFrames];\n'
+        '    struct StreamReadback {\n'
+        '        ComPtr<ID3D12Resource> buffer;\n'
+        '        uint64_t bytes = 0;\n'
+        '        uint32_t w = 0, h = 0, pitch = 0;\n'
+        '        bool pending = false;\n'
+        '    };\n'
+        '    StreamReadback stream_rb_[kFrames];\n'
+        '    void StreamCapture(Target& t);\n'
+        '    void StreamDeliver();')
+    backend = replace_once(backend, '    if (t) Resolve(*t);',
+        '    if (t) Resolve(*t);\n'
+        '    if (t && openshao::stream::WantsVideo()) StreamCapture(*t);')
+    backend = replace_once(backend,
+        '        g_perf.wait += PerfMs(perf_wait);\n    }\n    f.alloc->Reset();',
+        '        g_perf.wait += PerfMs(perf_wait);\n    }\n    StreamDeliver();\n    f.alloc->Reset();')
+    backend = replace_once(backend, 'void D3D12Backend::ResetFrame() {',
+        'void D3D12Backend::StreamCapture(Target& t) {\n'
+        '    StreamReadback& rb = stream_rb_[frame_ % kFrames];\n'
+        '    if (rb.pending) return;\n'
+        '    CopySource src = PrepareCopySource(t, {});\n'
+        '    if (!src.res) return;\n'
+        '    D3D12_RESOURCE_DESC rd = src.res->GetDesc();\n'
+        '    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;\n'
+        '    UINT rows;\n'
+        '    UINT64 row_size, bytes;\n'
+        '    dev_->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &row_size, &bytes);\n'
+        '    if (!rb.buffer || rb.bytes < bytes) {\n'
+        '        rb.buffer.Reset();\n'
+        '        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};\n'
+        '        D3D12_RESOURCE_DESC bd = BufferDesc(bytes);\n'
+        '        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,\n'
+        '                                                 nullptr, IID_PPV_ARGS(&rb.buffer)))) {\n'
+        '            rb.bytes = 0;\n'
+        '            return;\n'
+        '        }\n'
+        '        rb.bytes = bytes;\n'
+        '    }\n'
+        '    D3D12_TEXTURE_COPY_LOCATION dl{rb.buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};\n'
+        '    dl.PlacedFootprint = fp;\n'
+        '    D3D12_TEXTURE_COPY_LOCATION sl{src.res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};\n'
+        '    cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);\n'
+        '    if (src.down) CurrentFrame().garbage.push_back(src.down);\n'
+        '    rb.w = fp.Footprint.Width;\n'
+        '    rb.h = fp.Footprint.Height;\n'
+        '    rb.pitch = fp.Footprint.RowPitch;\n'
+        '    rb.pending = true;\n'
+        '}\n'
+        '\n'
+        '// called once the frame slot fence completed: the readback buffer holds the finished copy\n'
+        'void D3D12Backend::StreamDeliver() {\n'
+        '    StreamReadback& rb = stream_rb_[frame_ % kFrames];\n'
+        '    if (!rb.pending) return;\n'
+        '    rb.pending = false;\n'
+        '    uint8_t* p = nullptr;\n'
+        '    if (FAILED(rb.buffer->Map(0, nullptr, reinterpret_cast<void**>(&p)))) return;\n'
+        '    openshao::stream::SubmitVideo(p, rb.w, rb.h, rb.pitch);\n'
+        '    D3D12_RANGE none{0, 0};\n'
+        '    rb.buffer->Unmap(0, &none);\n'
+        '}\n'
+        '\n'
+        'void D3D12Backend::ResetFrame() {')
     if args.shadow_diagnostics:
         from prepare_shadow_diagnostics import adapt_backend
         backend = adapt_backend(backend, replace_once)

@@ -26,6 +26,7 @@
 #include "restart.h"
 #include "launcher_settings.h"
 #include "netplay.h"
+#include "stream.h"
 #include <cerrno>
 #include <limits>
 #include <algorithm>
@@ -127,6 +128,18 @@ int Configure() {
             std::string narrow(wide.begin(), wide.end());
             if (!netplay::ParseEndpoint(narrow, options.netplay_address, options.netplay_port)) invalid = true;
         }
+        else if (arg == L"--stream-host") {
+            options.stream_host = true;
+            if (i + 1 < argc && argv[i + 1][0] != L'-') {
+                options.stream_port = uint16_t(number(argv[++i], 65535));
+            }
+        }
+        else if (arg == L"--stream-join" && i + 1 < argc) {
+            options.stream_join = true;
+            const std::wstring wide = argv[++i];
+            std::string narrow(wide.begin(), wide.end());
+            if (!netplay::ParseEndpoint(narrow, options.stream_address, options.stream_port)) invalid = true;
+        }
         else if (arg == L"--netplay-delay" && i + 1 < argc) {
             options.netplay_delay = unsigned(number(argv[++i], netplay::kMaxDelay));
         }
@@ -151,6 +164,13 @@ int Configure() {
     if (options.configure_only && (options.background || options.setup || options.no_launcher || options.validate_disc || options.validate_language_pack)) invalid = true;
     if (!options.disc.empty() && !options.game.empty()) invalid = true;
     if (options.netplay_host && options.netplay_join) invalid = true;
+    const bool streaming = options.stream_host || options.stream_join;
+    if (streaming && (options.netplay_host || options.netplay_join || (options.stream_host && options.stream_join))) invalid = true;
+    if (streaming && (options.background || options.configure_only || options.setup || options.validate_disc ||
+                      options.validate_language_pack)) invalid = true;
+#ifndef _WIN32
+    if (streaming) invalid = true;
+#endif
     if ((options.netplay_host || options.netplay_join) &&
         (options.background || options.configure_only || options.setup || options.validate_disc || options.validate_language_pack))
         invalid = true;
@@ -180,7 +200,7 @@ int Configure() {
     }
     std::string error;
     if (!paths::Initialize(app::ExeDir(), options.background, options.data_dir, error, options.paths || options.restart_parent!=0)) {
-        if (paths::DataInUse() && (options.netplay_join || options.netplay_host) && options.data_dir.empty()) {
+        if (paths::DataInUse() && (options.netplay_join || options.netplay_host || options.stream_join || options.stream_host) && options.data_dir.empty()) {
             const auto base_root = paths::Root();
             const auto peer_root = base_root / "netplay-peer";
             std::error_code ec;
@@ -219,6 +239,15 @@ int Configure() {
 }
 
 bool StartNetplay() {
+    if (options.stream_host) {
+        std::string error;
+        if (!stream::StartHost(options.stream_port, error)) {
+            LOGE("LAN streaming initialization failed: %s", error.c_str());
+            paths::ReportError(std::filesystem::path(std::u8string(error.begin(), error.end())).wstring());
+            return false;
+        }
+        return true;
+    }
     if (!options.netplay_host && !options.netplay_join) return true;
     netplay::Config cfg{};
     cfg.role = options.netplay_host ? netplay::Role::Host : netplay::Role::Client;

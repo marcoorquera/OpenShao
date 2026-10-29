@@ -246,11 +246,24 @@ int main() {
               GuestTickCountMs() == peer_client.GuestTickCountMs(),
               "loading barrier preserves identical guest clocks after asymmetric loading swaps");
     }
+    // 6. Guest clocks keep moving while no lockstep frame completes (movies, loading screens)
+    {
+        Check(!TickIdleClock(), "idle clock waits for the stall threshold after a lockstep frame");
+        const uint32_t ticks_before = GuestTickCountMs();
+        std::this_thread::sleep_for(std::chrono::milliseconds(kIdleClockThresholdMs + 20));
+        Check(TickIdleClock() && TickIdleClock(), "idle clock advances once a lockstep stall is detected");
+        Check(GuestTickCountMs() > ticks_before, "guest tick count advances during a lockstep stall");
+        input::Pad p1{true, 0}, p2{true, 0};
+        std::thread step([&] { Check(peer_client.AdvanceFrame(p2, 0, false), "peer step after stall"); });
+        Check(AdvanceFrame(p1, 0, false), "global step after stall");
+        step.join();
+        Check(!TickIdleClock(), "idle clock stops after lockstep frames resume");
+    }
     Check(!GetSyncedPad(2).connected && !GetSyncedPad(-1).connected, "ports outside 0..1 report disconnected");
     peer_client.Stop();
     Stop();
     Check(!IsActive() && LocalPlayerIndex() == -1, "global Stop resets state");
 
-    std::puts("PASS: WirePad serialization, endpoint parser, UDP handshake, 120-frame lockstep, loading barrier and desync detection");
+    std::puts("PASS: WirePad serialization, endpoint parser, UDP handshake, 120-frame lockstep, loading barrier, idle clock and desync detection");
     return 0;
 }

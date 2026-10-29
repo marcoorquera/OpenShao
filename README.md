@@ -153,6 +153,18 @@ Netplay synchronizes both players' inputs on each frame over UDP port `27886`.
 
 To test with two windows on the same computer, connect the client to `127.0.0.1:27886`. The second instance automatically uses an isolated `netplay-peer` data folder when the primary data folder is in use.
 
+Lockstep netplay can desynchronize during gameplay. LAN streaming avoids this.
+
+### How does LAN streaming work?
+
+The host runs the only copy of the game in local Ko-op. It sends video and audio to Player 2 over UDP port `27886`. Player 2 sends a gamepad or keyboard state back. Player 2 does not need the game. LAN streaming is available on Windows.
+
+1. On the host system, run `.\OpenShao.exe --no-launcher --stream-host 27886`.
+2. On the Player 2 system, run `.\OpenShao.exe --no-launcher --stream-join <host IP>:27886`.
+3. Wait for Player 2 to connect before you select **Ko-op**.
+
+Player 2 joins the host as one more gamepad. It becomes Player 2 behind the host's first gamepad. Player 2 can use the default OpenShao keyboard keys in the viewer window. Press F11 or Alt+Enter in the viewer window to switch to full screen.
+
 ### How do I install mods or the Portuguese language pack?
 
 Open **Mods** in the launcher and select **Install**. A downloaded `.tar.xz` installs through **Install from file**.
@@ -181,6 +193,8 @@ Only one copy can run at a time with the same data folder.
 | `--netplay-host [port]` | Host a UDP lockstep netplay session as Player 1 (default port `27886`) |
 | `--netplay-join <host[:port]>` | Join a UDP lockstep netplay session as Player 2 |
 | `--netplay-delay <1..8>` | Set the netplay frame input delay |
+| `--stream-host [port]` | Host a LAN streaming session (default port `27886`) |
+| `--stream-join <host[:port]>` | Join a LAN streaming session as Player 2 |
 
 ### How do I report a problem?
 

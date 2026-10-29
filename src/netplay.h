@@ -14,6 +14,7 @@ inline constexpr uint32_t kDefaultDelay = 1;
 inline constexpr uint32_t kMaxDelay = 8;
 inline constexpr uint32_t kPacketMagic = 0x4F414853u; // 'SHAO'
 inline constexpr uint8_t kProtocolVersion = 1;
+inline constexpr uint32_t kIdleClockThresholdMs = 100;
 
 enum class Role : uint8_t {
     None = 0,
@@ -96,6 +97,7 @@ public:
 
     bool AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash = 0, bool in_gameplay = false);
     input::Pad GetSyncedPad(int port) const;
+    bool TickIdleClock();
 
 private:
     static constexpr size_t kRingSize = 128;
@@ -129,6 +131,9 @@ private:
     std::atomic<uint32_t> input_delay_{kDefaultDelay};
     std::atomic<uint32_t> desync_count_{0};
     std::atomic<uint16_t> bound_port_{0};
+    std::atomic<bool> in_advance_{false};
+    std::atomic<int64_t> last_advance_ms_{0};
+    std::atomic<uint32_t> idle_ticks_{0};
     uint32_t frame_timeout_ms_ = 60000;
     uint32_t highest_remote_frame_ = 0;
     bool has_remote_frame_ = false;
@@ -158,5 +163,6 @@ uint32_t GuestTickCountMs();
 
 bool AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash = 0, bool in_gameplay = false);
 input::Pad GetSyncedPad(int port);
+bool TickIdleClock();
 
 } // namespace openshao::netplay
