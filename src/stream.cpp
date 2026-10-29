@@ -1,5 +1,6 @@
 #include "stream.h"
 #include "stream_upnp.h"
+#include "stream_video.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -13,7 +14,6 @@
 #include <mstcpip.h>
 #include <windows.h>
 #include <objbase.h>
-#include <wincodec.h>
 #include <wrl/client.h>
 #include <xaudio2.h>
 #include <SDL3/SDL.h>
@@ -60,7 +60,6 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-constexpr float kJpegQuality = 0.85f;
 constexpr uint32_t kInputIntervalMs = 8;
 constexpr uint32_t kHelloIntervalMs = 250;
 constexpr uint32_t kPrefillAudio = 3;    // 30 ms of 10 ms packets
@@ -124,65 +123,6 @@ struct ComScope {
     ~ComScope() { if (SUCCEEDED(hr)) CoUninitialize(); }
 };
 
-ComPtr<IWICImagingFactory> CreateFactory() {
-    ComPtr<IWICImagingFactory> factory;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))))
-        LOGE("stream: Windows Imaging Component is unavailable");
-    return factory;
-}
-
-bool EncodeJpeg(IWICImagingFactory* factory, const uint8_t* bgra, uint32_t w, uint32_t h, std::vector<uint8_t>& out) {
-    ComPtr<IStream> stream;
-    ComPtr<IWICBitmapEncoder> encoder;
-    ComPtr<IWICBitmapFrameEncode> frame;
-    ComPtr<IPropertyBag2> props;
-    ComPtr<IWICBitmap> bitmap;
-    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) ||
-        FAILED(factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder)) ||
-        FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)) ||
-        FAILED(encoder->CreateNewFrame(&frame, &props)))
-        return false;
-    PROPBAG2 option{};
-    option.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
-    VARIANT value;
-    VariantInit(&value);
-    value.vt = VT_R4;
-    value.fltVal = kJpegQuality;
-    props->Write(1, &option, &value);
-    WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
-    if (FAILED(frame->Initialize(props.Get())) || FAILED(frame->SetSize(w, h)) || FAILED(frame->SetPixelFormat(&format)) ||
-        FAILED(factory->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppBGR, w * 4, w * h * 4,
-                                               const_cast<BYTE*>(bgra), &bitmap)) ||
-        FAILED(frame->WriteSource(bitmap.Get(), nullptr)) || FAILED(frame->Commit()) || FAILED(encoder->Commit()))
-        return false;
-    STATSTG stat{};
-    HGLOBAL global = nullptr;
-    if (FAILED(stream->Stat(&stat, STATFLAG_NONAME)) || FAILED(GetHGlobalFromStream(stream.Get(), &global))) return false;
-    const auto* data = static_cast<const uint8_t*>(GlobalLock(global));
-    if (!data) return false;
-    out.assign(data, data + size_t(stat.cbSize.QuadPart));
-    GlobalUnlock(global);
-    return true;
-}
-
-bool DecodeJpeg(IWICImagingFactory* factory, const std::vector<uint8_t>& jpeg, std::vector<uint8_t>& bgra,
-                uint32_t& w, uint32_t& h) {
-    ComPtr<IWICStream> stream;
-    ComPtr<IWICBitmapDecoder> decoder;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    ComPtr<IWICFormatConverter> converter;
-    if (FAILED(factory->CreateStream(&stream)) ||
-        FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(jpeg.data()), DWORD(jpeg.size()))) ||
-        FAILED(factory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder)) ||
-        FAILED(decoder->GetFrame(0, &frame)) || FAILED(factory->CreateFormatConverter(&converter)) ||
-        FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGR, WICBitmapDitherTypeNone, nullptr, 0,
-                                     WICBitmapPaletteTypeCustom)) ||
-        FAILED(converter->GetSize(&w, &h)))
-        return false;
-    bgra.resize(size_t(w) * h * 4);
-    return SUCCEEDED(converter->CopyPixels(nullptr, w * 4, UINT(bgra.size()), bgra.data()));
-}
-
 // ---------------------------------------------------------------- host
 
 struct Host {
@@ -190,6 +130,7 @@ struct Host {
     std::atomic<bool> running{false};
     std::atomic<bool> connected{false};
     std::atomic<uint32_t> seq{0};
+    std::atomic<bool> force_keyframe{true};
     std::thread net;
     std::thread encoder;
 
@@ -250,6 +191,7 @@ void HostNetwork() {
                     g_host.peer = from;
                     g_host.pad = {};
                     g_host.connected.store(true, std::memory_order_release);
+                    g_host.force_keyframe.store(true, std::memory_order_release);
                     LOGI("stream: Player 2 connected from %s", AddressText(from).c_str());
                 }
                 g_host.last_seen = now;
@@ -257,6 +199,9 @@ void HostNetwork() {
                 HostSend(BuildPacket(PacketType::Welcome, g_host.seq++, nullptr, 0));
             } else if (type == PacketType::Input && from_peer && header.size == sizeof(RemotePad)) {
                 std::memcpy(&g_host.pad, payload, sizeof(RemotePad));
+                g_host.last_seen = now;
+            } else if (type == PacketType::KeyframeRequest && from_peer) {
+                g_host.force_keyframe.store(true, std::memory_order_release);
                 g_host.last_seen = now;
             } else if (type == PacketType::Bye && from_peer) {
                 guard.unlock();
@@ -274,10 +219,11 @@ void HostNetwork() {
 
 void HostEncoder() {
     ComScope com(COINIT_MULTITHREADED);
-    auto factory = CreateFactory();
-    std::vector<uint8_t> pixels, jpeg;
+    const bool media = StartMediaFoundation();
+    VideoEncoder encoder;
+    std::vector<uint8_t> pixels, nv12, encoded;
     while (g_host.running.load(std::memory_order_acquire)) {
-        uint32_t w = 0, h = 0, id = 0;
+        uint32_t w = 0, h = 0;
         {
             std::unique_lock guard(g_host.frame_lock);
             g_host.frame_cv.wait_for(guard, std::chrono::milliseconds(100), [] {
@@ -287,24 +233,29 @@ void HostEncoder() {
             pixels.swap(g_host.frame);
             w = g_host.frame_w;
             h = g_host.frame_h;
-            id = ++g_host.frame_id;
             g_host.frame_ready = false;
         }
-        if (!factory || !EncodeJpeg(factory.Get(), pixels.data(), w, h, jpeg)) {
-            LOG_FIRST(1, "stream: video frame encoding failed");
+        uint32_t ew = 0, eh = 0;
+        BgraToNv12(pixels.data(), w * 4, w, h, VideoScale(w, h), nv12, ew, eh);
+        const bool force = g_host.force_keyframe.exchange(false, std::memory_order_acq_rel);
+        bool key = false;
+        if (!media || !ew || !eh || !encoder.Encode(nv12.data(), ew, eh, force, encoded, key)) {
+            if (force) g_host.force_keyframe.store(true, std::memory_order_release);
             continue;
         }
+        if (encoded.empty()) continue;
         VideoChunk chunk{};
-        chunk.frame = id;
-        chunk.width = uint16_t(w);
-        chunk.height = uint16_t(h);
-        chunk.total = uint32_t(jpeg.size());
-        chunk.count = ChunkCount(jpeg.size());
+        chunk.frame = ++g_host.frame_id;
+        chunk.width = uint16_t(ew);
+        chunk.height = uint16_t(eh);
+        chunk.total = uint32_t(encoded.size());
+        chunk.count = ChunkCount(encoded.size());
+        chunk.flags = key ? kVideoFlagKeyframe : 0;
         for (uint16_t i = 0; i < chunk.count; ++i) {
             chunk.index = i;
             const size_t offset = size_t(i) * kMaxChunk;
-            const size_t size = std::min(kMaxChunk, jpeg.size() - offset);
-            HostSend(BuildPacket(PacketType::Video, g_host.seq++, &chunk, sizeof(chunk), jpeg.data() + offset, size));
+            const size_t size = std::min(kMaxChunk, encoded.size() - offset);
+            HostSend(BuildPacket(PacketType::Video, g_host.seq++, &chunk, sizeof(chunk), encoded.data() + offset, size));
         }
     }
 }
@@ -396,9 +347,21 @@ void ClientAudio(Client& c, const AudioChunk& chunk, const uint8_t* samples, siz
 
 void ClientNetwork(Client& c) {
     ComScope com(COINIT_MULTITHREADED);
-    auto factory = CreateFactory();
+    const bool media = StartMediaFoundation();
+    VideoDecoder decoder;
     FrameAssembler assembler;
-    std::vector<uint8_t> buffer(2048), jpeg, pixels;
+    std::vector<uint8_t> buffer(2048), encoded, pixels;
+    // Until a keyframe arrives, predicted frames would only show corrupted pictures.
+    bool waiting_keyframe = true;
+    bool has_frame = false;
+    uint32_t last_frame = 0, last_request = 0;
+    auto request_keyframe = [&] {
+        const uint32_t now = NowMs();
+        if (c.connected.load(std::memory_order_acquire) && now - last_request >= kKeyframeRequestMs) {
+            ClientSend(c, PacketType::KeyframeRequest, 0);
+            last_request = now;
+        }
+    };
     while (c.running.load(std::memory_order_acquire)) {
         sockaddr_in from{};
         int from_len = sizeof(from);
@@ -406,26 +369,48 @@ void ClientNetwork(Client& c) {
                                reinterpret_cast<sockaddr*>(&from), &from_len);
         Header header;
         const uint8_t* payload = nullptr;
+        if (waiting_keyframe) request_keyframe();
         if (n <= 0 || !SameAddress(from, c.host) || !ParsePacket(buffer.data(), size_t(n), header, payload)) continue;
         c.last_packet.store(NowMs(), std::memory_order_release);
         const auto type = PacketType(header.type);
         if (type == PacketType::Welcome) {
             if (!c.connected.exchange(true)) {
                 c.audio.Reset();
+                waiting_keyframe = true;
+                has_frame = false;
+                last_request = NowMs() - kKeyframeRequestMs;
                 LOGI("stream: connected to host %s", AddressText(c.host).c_str());
                 PostMessageW(c.window, WM_APP + 1, 0, 0);
             }
         } else if (type == PacketType::Video && header.size > sizeof(VideoChunk)) {
             VideoChunk chunk;
             std::memcpy(&chunk, payload, sizeof(chunk));
-            if (!assembler.Add(chunk, payload + sizeof(chunk), header.size - sizeof(chunk), jpeg)) continue;
-            uint32_t w = 0, h = 0;
-            if (!factory || !DecodeJpeg(factory.Get(), jpeg, pixels, w, h)) continue;
+            if (chunk.codec != kVideoCodecH264 || !media) continue;
+            if (!assembler.Add(chunk, payload + sizeof(chunk), header.size - sizeof(chunk), encoded)) continue;
+            const bool key = (chunk.flags & kVideoFlagKeyframe) != 0;
+            // A gap in frame ids means a lost frame that later frames reference.
+            if (has_frame && chunk.frame != last_frame + 1) waiting_keyframe = true;
+            has_frame = true;
+            last_frame = chunk.frame;
+            if (waiting_keyframe && !key) {
+                request_keyframe();
+                continue;
+            }
+            if (key) waiting_keyframe = false;
+            bool failed = false;
+            if (!decoder.Decode(encoded.data(), encoded.size(), chunk.width, chunk.height, pixels, failed)) {
+                if (failed) {
+                    decoder.Reset();
+                    waiting_keyframe = true;
+                    request_keyframe();
+                }
+                continue;
+            }
             {
                 std::lock_guard guard(c.frame_lock);
                 c.frame.swap(pixels);
-                c.frame_w = w;
-                c.frame_h = h;
+                c.frame_w = chunk.width;
+                c.frame_h = chunk.height;
             }
             InvalidateRect(c.window, nullptr, FALSE);
         } else if (type == PacketType::Audio && header.size > sizeof(AudioChunk)) {
@@ -434,6 +419,8 @@ void ClientNetwork(Client& c) {
             ClientAudio(c, chunk, payload + sizeof(chunk), header.size - sizeof(chunk));
         } else if (type == PacketType::Bye) {
             c.audio.Reset();
+            waiting_keyframe = true;
+            has_frame = false;
             if (c.connected.exchange(false)) LOGI("stream: host closed the session");
             PostMessageW(c.window, WM_APP + 1, 0, 0);
         }

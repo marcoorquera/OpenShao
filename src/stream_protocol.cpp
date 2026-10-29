@@ -111,6 +111,76 @@ bool AudioDecoder::Decode(const AudioChunk& chunk, const uint8_t* data, size_t s
         [&](const int16_t* pcm) { out.insert(out.end(), pcm, pcm + frame.size()); });
 }
 
+uint32_t VideoScale(uint32_t width, uint32_t height) {
+    uint32_t scale = 1;
+    while (width / scale > kVideoMaxWidth || height / scale > kVideoMaxHeight) ++scale;
+    return scale;
+}
+
+namespace {
+
+uint8_t Clamp8(int v) { return uint8_t(v < 0 ? 0 : v > 255 ? 255 : v); }
+
+} // namespace
+
+void BgraToNv12(const uint8_t* bgra, uint32_t pitch, uint32_t width, uint32_t height, uint32_t scale,
+                std::vector<uint8_t>& nv12, uint32_t& out_width, uint32_t& out_height) {
+    if (!scale) scale = 1;
+    out_width = (width / scale) & ~1u;
+    out_height = (height / scale) & ~1u;
+    nv12.resize(size_t(out_width) * out_height * 3 / 2);
+    if (!out_width || !out_height) return;
+    uint8_t* y_plane = nv12.data();
+    uint8_t* uv_plane = y_plane + size_t(out_width) * out_height;
+    const uint32_t area = scale * scale;
+    for (uint32_t oy = 0; oy < out_height; oy += 2) {
+        for (uint32_t ox = 0; ox < out_width; ox += 2) {
+            int sum_r = 0, sum_g = 0, sum_b = 0;
+            for (uint32_t dy = 0; dy < 2; ++dy) {
+                for (uint32_t dx = 0; dx < 2; ++dx) {
+                    uint32_t r = 0, g = 0, b = 0;
+                    for (uint32_t sy = 0; sy < scale; ++sy) {
+                        const uint8_t* row = bgra + size_t((oy + dy) * scale + sy) * pitch + size_t((ox + dx) * scale) * 4;
+                        for (uint32_t sx = 0; sx < scale; ++sx) {
+                            b += row[sx * 4];
+                            g += row[sx * 4 + 1];
+                            r += row[sx * 4 + 2];
+                        }
+                    }
+                    const int ri = int(r / area), gi = int(g / area), bi = int(b / area);
+                    y_plane[size_t(oy + dy) * out_width + ox + dx] = Clamp8(16 + ((47 * ri + 157 * gi + 16 * bi + 128) >> 8));
+                    sum_r += ri;
+                    sum_g += gi;
+                    sum_b += bi;
+                }
+            }
+            const int r = sum_r / 4, g = sum_g / 4, b = sum_b / 4;
+            uint8_t* uv = uv_plane + size_t(oy / 2) * out_width + ox;
+            uv[0] = Clamp8(128 + ((-26 * r - 87 * g + 112 * b + 128) >> 8));
+            uv[1] = Clamp8(128 + ((112 * r - 102 * g - 10 * b + 128) >> 8));
+        }
+    }
+}
+
+void Nv12ToBgra(const uint8_t* y, const uint8_t* uv, uint32_t pitch, uint32_t width, uint32_t height,
+                std::vector<uint8_t>& bgra) {
+    bgra.resize(size_t(width) * height * 4);
+    for (uint32_t row = 0; row < height; ++row) {
+        const uint8_t* yr = y + size_t(row) * pitch;
+        const uint8_t* uvr = uv + size_t(row / 2) * pitch;
+        uint8_t* out = bgra.data() + size_t(row) * width * 4;
+        for (uint32_t col = 0; col < width; ++col) {
+            const int c = 298 * (int(yr[col]) - 16);
+            const int u = int(uvr[col & ~1u]) - 128;
+            const int v = int(uvr[(col & ~1u) + 1]) - 128;
+            out[col * 4] = Clamp8((c + 541 * u + 128) >> 8);
+            out[col * 4 + 1] = Clamp8((c - 55 * u - 136 * v + 128) >> 8);
+            out[col * 4 + 2] = Clamp8((c + 459 * v + 128) >> 8);
+            out[col * 4 + 3] = 255;
+        }
+    }
+}
+
 bool ParsePacket(const uint8_t* data, size_t size, Header& header, const uint8_t*& payload) {
     if (size < sizeof(Header)) return false;
     std::memcpy(&header, data, sizeof(Header));

@@ -14,7 +14,7 @@ namespace openshao::stream {
 
 inline constexpr uint16_t kDefaultPort = 27886;
 inline constexpr uint32_t kMagic = 0x5453484Fu; // 'OHST'
-inline constexpr uint8_t kVersion = 2;
+inline constexpr uint8_t kVersion = 3;
 // Keeps every datagram below a 1280-byte IPv6 minimum MTU.
 inline constexpr size_t kMaxChunk = 1180;
 inline constexpr uint32_t kPeerTimeoutMs = 3000;
@@ -24,6 +24,14 @@ inline constexpr uint16_t kAudioCodecOpus = 1;
 inline constexpr uint32_t kAudioBitrate = 128000;
 inline constexpr uint32_t kMaxPlcFrames = 3;
 inline constexpr uint32_t kAudioResyncPackets = 50; // 500 ms
+inline constexpr uint8_t kVideoCodecH264 = 1;
+inline constexpr uint8_t kVideoFlagKeyframe = 1;
+inline constexpr uint32_t kVideoFrameRate = 60;
+inline constexpr uint32_t kVideoBitrate = 8'000'000;
+inline constexpr uint32_t kVideoGopFrames = 240;    // a periodic keyframe repairs any missed request
+inline constexpr uint32_t kVideoMaxWidth = 1280;
+inline constexpr uint32_t kVideoMaxHeight = 960;
+inline constexpr uint32_t kKeyframeRequestMs = 250;
 
 enum class PacketType : uint8_t {
     Hello = 1,
@@ -31,7 +39,8 @@ enum class PacketType : uint8_t {
     Input = 3,
     Video = 4,
     Audio = 5,
-    Bye = 6
+    Bye = 6,
+    KeyframeRequest = 7
 };
 
 #pragma pack(push, 1)
@@ -56,6 +65,9 @@ struct VideoChunk {
     uint32_t total = 0; // encoded frame bytes
     uint16_t index = 0;
     uint16_t count = 0;
+    uint8_t codec = kVideoCodecH264;
+    uint8_t flags = 0;
+    uint16_t reserved = 0;
 };
 
 struct AudioChunk {
@@ -68,13 +80,21 @@ struct AudioChunk {
 
 static_assert(sizeof(Header) == 12, "stream header layout must remain fixed");
 static_assert(sizeof(RemotePad) == 16, "remote pad layout must remain fixed");
-static_assert(sizeof(VideoChunk) == 16, "video chunk layout must remain fixed");
+static_assert(sizeof(VideoChunk) == 20, "video chunk layout must remain fixed");
 static_assert(sizeof(AudioChunk) == 12, "audio chunk layout must remain fixed");
 
 bool ParsePacket(const uint8_t* data, size_t size, Header& header, const uint8_t*& payload);
 std::vector<uint8_t> BuildPacket(PacketType type, uint32_t seq, const void* payload, size_t size,
                                  const void* extra = nullptr, size_t extra_size = 0);
 uint16_t ChunkCount(size_t total);
+
+// Integer downscale factor that fits a captured frame inside kVideoMaxWidth x kVideoMaxHeight.
+uint32_t VideoScale(uint32_t width, uint32_t height);
+// BT.709 limited range. BgraToNv12 box-filters by `scale` and rounds the output size down to even.
+void BgraToNv12(const uint8_t* bgra, uint32_t pitch, uint32_t width, uint32_t height, uint32_t scale,
+                std::vector<uint8_t>& nv12, uint32_t& out_width, uint32_t& out_height);
+void Nv12ToBgra(const uint8_t* y, const uint8_t* uv, uint32_t pitch, uint32_t width, uint32_t height,
+                std::vector<uint8_t>& bgra);
 
 // Accumulates float stereo input into 10 ms (480-frame) Opus packets.
 class AudioEncoder {
