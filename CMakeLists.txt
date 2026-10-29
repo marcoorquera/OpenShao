@@ -165,7 +165,7 @@ target_compile_definitions(OpenShao PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARN
 set_source_files_properties("${HOST_ADAPTED}/main.cpp" PROPERTIES COMPILE_DEFINITIONS "OPENSHAO_RECOMP_VERSION=\"${PROJECT_VERSION}\"")
 target_compile_options(OpenShao PRIVATE -fno-strict-aliasing -march=x86-64-v2)
 target_link_options(OpenShao PRIVATE -fuse-ld=lld -g "LINKER:/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/resources/app.manifest")
-target_link_libraries(OpenShao PRIVATE openshao_mods miniz tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32 shell32 uuid comctl32)
+target_link_libraries(OpenShao PRIVATE openshao_mods miniz tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32 iphlpapi shell32 uuid comctl32)
 enable_testing()
 add_executable(recomp_settings_ui_test tests/recomp_settings_ui_test.cpp src/recomp_settings_model.cpp src/launcher_settings.cpp src/menu_text.cpp src/mods/json.cpp)
 target_include_directories(recomp_settings_ui_test PRIVATE src "${OPENSHAO_RECOMP_SDK}/runtime" "${GEN}")
