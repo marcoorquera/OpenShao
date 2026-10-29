@@ -34,7 +34,7 @@ struct Config {
     uint16_t port = kDefaultPort;
     uint32_t input_delay = kDefaultDelay;
     uint32_t handshake_timeout_ms = 30000;
-    uint32_t frame_timeout_ms = 5000;
+    uint32_t frame_timeout_ms = 60000;
     uint32_t fixed_seed = 0; // 0 generates a time-based seed on Host
 };
 
@@ -89,11 +89,12 @@ public:
     uint16_t BoundPort() const { return bound_port_.load(std::memory_order_acquire); }
 
     uint64_t GuestPerfCounter();
+    uint64_t GuestRdtsc();
     uint64_t GuestInterruptTime100ns() const;
     uint64_t GuestSystemTime100ns() const;
     uint32_t GuestTickCountMs() const;
 
-    bool AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash = 0);
+    bool AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash = 0, bool in_gameplay = false);
     input::Pad GetSyncedPad(int port) const;
 
 private:
@@ -102,13 +103,14 @@ private:
         uint32_t frame = UINT32_MAX;
         input::Pad pad{};
         uint32_t state_hash = 0;
+        bool in_gameplay = false;
         bool has_pad = false;
         bool has_hash = false;
     };
 
     bool SendPacket(const Packet& pkt);
     void PumpIncoming();
-    void StoreRemotePad(uint32_t frame, const input::Pad& pad, uint32_t state_hash, bool include_hash);
+    void StoreRemotePad(uint32_t frame, const input::Pad& pad, uint32_t state_hash, bool include_hash, bool in_gameplay);
 
     mutable std::mutex mutex_;
     intptr_t socket_ = -1;
@@ -120,12 +122,14 @@ private:
     std::atomic<bool> is_loopback_{false};
     std::atomic<Role> role_{Role::None};
     std::atomic<uint32_t> current_frame_{0};
+    std::atomic<uint32_t> clock_frame_{0};
     std::atomic<uint32_t> sub_frame_ticks_{0};
+    std::atomic<uint32_t> rdtsc_sub_ticks_{0};
     std::atomic<uint32_t> agreed_seed_{0};
     std::atomic<uint32_t> input_delay_{kDefaultDelay};
     std::atomic<uint32_t> desync_count_{0};
     std::atomic<uint16_t> bound_port_{0};
-    uint32_t frame_timeout_ms_ = 5000;
+    uint32_t frame_timeout_ms_ = 60000;
     uint32_t highest_remote_frame_ = 0;
     bool has_remote_frame_ = false;
 
@@ -147,11 +151,12 @@ uint32_t InputDelay();
 uint32_t DesyncCount();
 
 uint64_t GuestPerfCounter();
+uint64_t GuestRdtsc();
 uint64_t GuestInterruptTime100ns();
 uint64_t GuestSystemTime100ns();
 uint32_t GuestTickCountMs();
 
-bool AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash = 0);
+bool AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash = 0, bool in_gameplay = false);
 input::Pad GetSyncedPad(int port);
 
 } // namespace openshao::netplay

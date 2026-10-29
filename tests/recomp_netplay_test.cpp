@@ -146,6 +146,12 @@ int main() {
     const uint64_t c_second = client_session.GuestPerfCounter();
     Check(p_first == c_first && p_second == c_second && p_second > p_first,
           "GuestPerfCounter advances monotonically within a frame and matches across peers");
+    const uint64_t r_first = host_session.GuestRdtsc();
+    const uint64_t r_second = host_session.GuestRdtsc();
+    const uint64_t cr_first = client_session.GuestRdtsc();
+    const uint64_t cr_second = client_session.GuestRdtsc();
+    Check(r_first == cr_first && r_second == cr_second && r_second == r_first + 733,
+          "GuestRdtsc advances deterministically by 733 cycles per intra-frame call and matches across peers");
     Check(host_session.InputDelay() == kDelay && client_session.InputDelay() == kDelay,
           "client synchronized input delay from host handshake");
     Check(host_session.DesyncCount() == 1 && client_session.DesyncCount() == 1,
@@ -207,18 +213,44 @@ int main() {
           "global singleton state active after handshake");
     for (uint32_t f = 0; f < 4; ++f) {
         input::Pad p1{true, uint16_t(0x10 + f)}, p2{true, uint16_t(0x20 + f)};
-        std::thread step([&] { Check(peer_client.AdvanceFrame(p2, 0x55AAu + f), "peer step"); });
-        Check(AdvanceFrame(p1, 0x55AAu + f), "global step");
+        std::thread step([&] { Check(peer_client.AdvanceFrame(p2, 0x55AAu + f, false), "peer step"); });
+        Check(AdvanceFrame(p1, 0x55AAu + f, false), "global step");
         step.join();
         Check(SamePad(GetSyncedPad(0), peer_client.GetSyncedPad(0)) &&
               SamePad(GetSyncedPad(1), peer_client.GetSyncedPad(1)),
               "global GetSyncedPad matches peer across frames");
+    }
+    // 5. Asynchronous level-loading barrier: Host enters gameplay immediately while Client
+    // takes 12 extra loading swaps before entering gameplay; both must emerge aligned.
+    {
+        std::thread client_loader([&] {
+            for (int loading = 0; loading < 12; ++loading) {
+                input::Pad p2{true, 0};
+                Check(peer_client.AdvanceFrame(p2, 0, false), "client loading swap");
+            }
+            // Client finishes loading and enters gameplay (delay = 1 requires 2 gameplay steps to cross barrier)
+            for (int g = 0; g < 2; ++g) {
+                input::Pad p2{true, uint16_t(0x400 + g)};
+                Check(peer_client.AdvanceFrame(p2, 0x9999u + g, true), "client gameplay ready step");
+            }
+        });
+        for (int g = 0; g < 2; ++g) {
+            input::Pad p1{true, uint16_t(0x300 + g)};
+            Check(AdvanceFrame(p1, 0x9999u + g, true), "host barrier gameplay step");
+        }
+        client_loader.join();
+        Check(CurrentFrame() == peer_client.CurrentFrame(),
+              "loading barrier aligns CurrentFrame when one peer finishes loading earlier");
+        Check(GuestRdtsc() == peer_client.GuestRdtsc() &&
+              GuestPerfCounter() == peer_client.GuestPerfCounter() &&
+              GuestTickCountMs() == peer_client.GuestTickCountMs(),
+              "loading barrier preserves identical guest clocks after asymmetric loading swaps");
     }
     Check(!GetSyncedPad(2).connected && !GetSyncedPad(-1).connected, "ports outside 0..1 report disconnected");
     peer_client.Stop();
     Stop();
     Check(!IsActive() && LocalPlayerIndex() == -1, "global Stop resets state");
 
-    std::puts("PASS: WirePad serialization, endpoint parser, UDP handshake, 120-frame lockstep and desync detection");
+    std::puts("PASS: WirePad serialization, endpoint parser, UDP handshake, 120-frame lockstep, loading barrier and desync detection");
     return 0;
 }

@@ -191,6 +191,14 @@ int Configure() {
                                                std::filesystem::copy_options::overwrite_existing, ec);
                 }
             }
+            std::filesystem::create_directories(peer_root / "cache", ec);
+            for (const char* cache_file : {"cache/shaders.bin", "cache/pipelines.bin"}) {
+                if (std::filesystem::is_regular_file(base_root / cache_file, ec) &&
+                    !std::filesystem::is_regular_file(peer_root / cache_file, ec)) {
+                    std::filesystem::copy_file(base_root / cache_file, peer_root / cache_file,
+                                               std::filesystem::copy_options::overwrite_existing, ec);
+                }
+            }
             if (paths::Initialize(app::ExeDir(), options.background, peer_root, error, false)) {
                 if (options.save_dir.empty() && !options.portable_saves) options.save_dir = peer_root / "hdd";
                 options.data_dir = paths::Root();

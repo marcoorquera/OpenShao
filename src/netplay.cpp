@@ -211,18 +211,22 @@ bool Session::SendPacket(const Packet& pkt) {
     return false;
 }
 
-void Session::StoreRemotePad(uint32_t frame, const input::Pad& pad, uint32_t state_hash, bool include_hash) {
+void Session::StoreRemotePad(uint32_t frame, const input::Pad& pad, uint32_t state_hash, bool include_hash, bool in_gameplay) {
     auto& slot = remote_ring_[frame % kRingSize];
     if (slot.frame != frame || !slot.has_pad) {
         slot.frame = frame;
         slot.pad = pad;
         slot.pad.connected = true;
+        slot.in_gameplay = in_gameplay;
         slot.has_pad = true;
         slot.state_hash = include_hash ? state_hash : 0;
         slot.has_hash = include_hash && state_hash != 0;
-    } else if (include_hash && state_hash != 0 && !slot.has_hash) {
-        slot.state_hash = state_hash;
-        slot.has_hash = true;
+    } else {
+        if (in_gameplay) slot.in_gameplay = true;
+        if (include_hash && state_hash != 0 && !slot.has_hash) {
+            slot.state_hash = state_hash;
+            slot.has_hash = true;
+        }
     }
     if (!has_remote_frame_ || frame > highest_remote_frame_) {
         highest_remote_frame_ = frame;
@@ -270,11 +274,13 @@ void Session::PumpIncoming() {
         }
         if (type == PacketType::FrameInput) {
             const uint8_t expected_remote = role_.load(std::memory_order_relaxed) == Role::Host ? 1 : 0;
-            if (pkt.player_index != expected_remote) continue;
+            if ((pkt.player_index & 0x03u) != expected_remote) continue;
+            const bool cur_gameplay = (pkt.player_index & 0x80u) != 0;
+            const bool prev_gameplay = (pkt.player_index & 0x40u) != 0;
             if (pkt.frame > 0) {
-                StoreRemotePad(pkt.frame - 1, UnpackPad(pkt.prev_pad), 0, false);
+                StoreRemotePad(pkt.frame - 1, UnpackPad(pkt.prev_pad), 0, false, prev_gameplay);
             }
-            StoreRemotePad(pkt.frame, UnpackPad(pkt.pad), pkt.state_hash, true);
+            StoreRemotePad(pkt.frame, UnpackPad(pkt.pad), pkt.state_hash, true, cur_gameplay);
         }
     }
 }
@@ -326,10 +332,12 @@ bool Session::Start(const Config& config, std::string& error) {
     socket_ = intptr_t(sock);
     role_.store(config.role, std::memory_order_release);
     current_frame_.store(0, std::memory_order_release);
+    clock_frame_.store(0, std::memory_order_release);
     sub_frame_ticks_.store(0, std::memory_order_release);
+    rdtsc_sub_ticks_.store(0, std::memory_order_release);
     desync_count_.store(0, std::memory_order_release);
     is_loopback_.store(false, std::memory_order_release);
-    frame_timeout_ms_ = config.frame_timeout_ms ? config.frame_timeout_ms : 5000;
+    frame_timeout_ms_ = config.frame_timeout_ms ? config.frame_timeout_ms : 60000;
     highest_remote_frame_ = 0;
     has_remote_frame_ = false;
     has_peer_ = false;
@@ -454,9 +462,11 @@ bool Session::Start(const Config& config, std::string& error) {
                          config.host_address.c_str(), unsigned(config.port), delay, pkt.rng_seed);
                     break;
                 }
-                if (PacketType(pkt.type) == PacketType::FrameInput && pkt.player_index == 0) {
-                    if (pkt.frame > 0) StoreRemotePad(pkt.frame - 1, UnpackPad(pkt.prev_pad), 0, false);
-                    StoreRemotePad(pkt.frame, UnpackPad(pkt.pad), pkt.state_hash, true);
+                if (PacketType(pkt.type) == PacketType::FrameInput && (pkt.player_index & 0x03u) == 0) {
+                    const bool cur_gameplay = (pkt.player_index & 0x80u) != 0;
+                    const bool prev_gameplay = (pkt.player_index & 0x40u) != 0;
+                    if (pkt.frame > 0) StoreRemotePad(pkt.frame - 1, UnpackPad(pkt.prev_pad), 0, false, prev_gameplay);
+                    StoreRemotePad(pkt.frame, UnpackPad(pkt.pad), pkt.state_hash, true, cur_gameplay);
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -482,10 +492,11 @@ bool Session::Start(const Config& config, std::string& error) {
         local_slot.frame = f;
         local_slot.pad = neutral;
         local_slot.state_hash = 0;
+        local_slot.in_gameplay = false;
         local_slot.has_pad = true;
         local_slot.has_hash = false;
 
-        StoreRemotePad(f, neutral, 0, false);
+        StoreRemotePad(f, neutral, 0, false, false);
     }
     synced_pads_[0] = neutral;
     synced_pads_[1] = neutral;
@@ -514,83 +525,107 @@ void Session::Stop() {
     has_peer_ = false;
 }
 
-bool Session::AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash) {
+bool Session::AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash, bool in_gameplay) {
     std::lock_guard guard(mutex_);
     if (!active_.load(std::memory_order_relaxed)) return false;
 
-    const uint32_t frame = current_frame_.load(std::memory_order_relaxed);
+    const uint32_t initial_frame = current_frame_.load(std::memory_order_relaxed);
+    uint32_t frame = initial_frame;
     const uint32_t delay = input_delay_.load(std::memory_order_relaxed);
-    const uint32_t target_frame = frame + delay;
+    const uint8_t base_player = role_.load(std::memory_order_relaxed) == Role::Host ? 0u : 1u;
 
-    input::Pad sanitized = local_pad;
-    sanitized.connected = true;
+    for (;;) {
+        const uint32_t target_frame = frame + delay;
+        const bool waiting_for_peer_load = (frame > initial_frame);
 
-    auto& local_target = local_ring_[target_frame % kRingSize];
-    local_target.frame = target_frame;
-    local_target.pad = sanitized;
-    local_target.state_hash = local_state_hash;
-    local_target.has_pad = true;
-    local_target.has_hash = local_state_hash != 0;
+        input::Pad sanitized = waiting_for_peer_load ? input::Pad{} : local_pad;
+        sanitized.connected = true;
+        const uint32_t hash_to_send = waiting_for_peer_load ? 0u : local_state_hash;
 
-    input::Pad prev_pad{};
-    prev_pad.connected = true;
-    if (target_frame > 0) {
-        const auto& prev_slot = local_ring_[(target_frame - 1) % kRingSize];
-        if (prev_slot.has_pad && prev_slot.frame == target_frame - 1) {
-            prev_pad = prev_slot.pad;
+        auto& local_target = local_ring_[target_frame % kRingSize];
+        local_target.frame = target_frame;
+        local_target.pad = sanitized;
+        local_target.state_hash = hash_to_send;
+        local_target.in_gameplay = in_gameplay;
+        local_target.has_pad = true;
+        local_target.has_hash = hash_to_send != 0;
+
+        input::Pad prev_pad{};
+        prev_pad.connected = true;
+        bool prev_gameplay = false;
+        if (target_frame > 0) {
+            const auto& prev_slot = local_ring_[(target_frame - 1) % kRingSize];
+            if (prev_slot.has_pad && prev_slot.frame == target_frame - 1) {
+                prev_pad = prev_slot.pad;
+                prev_gameplay = prev_slot.in_gameplay;
+            }
         }
-    }
 
-    Packet out{};
-    out.type = uint8_t(PacketType::FrameInput);
-    out.player_index = role_.load(std::memory_order_relaxed) == Role::Host ? 0 : 1;
-    out.input_delay = uint8_t(delay);
-    out.frame = target_frame;
-    out.ack_frame = has_remote_frame_ ? highest_remote_frame_ : 0;
-    out.rng_seed = agreed_seed_.load(std::memory_order_relaxed);
-    out.state_hash = local_state_hash;
-    out.pad = PackPad(sanitized);
-    out.prev_pad = PackPad(prev_pad);
+        Packet out{};
+        out.type = uint8_t(PacketType::FrameInput);
+        out.player_index = base_player | (in_gameplay ? 0x80u : 0u) | (prev_gameplay ? 0x40u : 0u);
+        out.input_delay = uint8_t(delay);
+        out.frame = target_frame;
+        out.ack_frame = has_remote_frame_ ? highest_remote_frame_ : 0;
+        out.rng_seed = agreed_seed_.load(std::memory_order_relaxed);
+        out.state_hash = hash_to_send;
+        out.pad = PackPad(sanitized);
+        out.prev_pad = PackPad(prev_pad);
 
-    SendPacket(out);
-    PumpIncoming();
-
-    const auto wait_start = std::chrono::steady_clock::now();
-    auto last_resend = wait_start;
-    const auto timeout = std::chrono::milliseconds(frame_timeout_ms_);
-
-    while (active_.load(std::memory_order_relaxed)) {
-        const auto& remote_slot = remote_ring_[frame % kRingSize];
-        if (remote_slot.has_pad && remote_slot.frame == frame) {
-            break;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now - wait_start >= timeout) {
-            LOGE("netplay: timed out waiting for remote frame %u, disconnecting", frame);
-            active_.store(false, std::memory_order_release);
-            return false;
-        }
-        if (now - last_resend >= std::chrono::milliseconds(4)) {
-            out.ack_frame = has_remote_frame_ ? highest_remote_frame_ : 0;
-            SendPacket(out);
-            last_resend = now;
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        SendPacket(out);
         PumpIncoming();
-    }
 
-    if (!active_.load(std::memory_order_relaxed)) return false;
+        const auto wait_start = std::chrono::steady_clock::now();
+        auto last_resend = wait_start;
+        const auto timeout = std::chrono::milliseconds(frame_timeout_ms_);
+
+        while (active_.load(std::memory_order_relaxed)) {
+            const auto& remote_slot = remote_ring_[frame % kRingSize];
+            if (remote_slot.has_pad && remote_slot.frame == frame) {
+                break;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - wait_start >= timeout) {
+                LOGE("netplay: timed out waiting for remote frame %u, disconnecting", frame);
+                active_.store(false, std::memory_order_release);
+                return false;
+            }
+            if (now - last_resend >= std::chrono::milliseconds(4)) {
+                out.ack_frame = has_remote_frame_ ? highest_remote_frame_ : 0;
+                SendPacket(out);
+                last_resend = now;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            PumpIncoming();
+        }
+
+        if (!active_.load(std::memory_order_relaxed)) return false;
+
+        const auto& local_now = local_ring_[frame % kRingSize];
+        const auto& remote_now = remote_ring_[frame % kRingSize];
+        if (local_now.in_gameplay && !remote_now.in_gameplay) {
+            ++frame;
+            continue;
+        }
+        break;
+    }
 
     const auto& local_now = local_ring_[frame % kRingSize];
     const auto& remote_now = remote_ring_[frame % kRingSize];
+    const bool same_phase = (local_now.in_gameplay == remote_now.in_gameplay);
 
-    if (local_now.has_hash && remote_now.has_hash && local_now.state_hash != remote_now.state_hash) {
+    if (same_phase && local_now.has_hash && remote_now.has_hash && local_now.state_hash != remote_now.state_hash) {
         const uint32_t count = desync_count_.fetch_add(1, std::memory_order_relaxed) + 1;
         LOGW("netplay: state hash mismatch at frame %u (local=%08X remote=%08X count=%u)",
              frame, local_now.state_hash, remote_now.state_hash, count);
     }
 
-    if (role_.load(std::memory_order_relaxed) == Role::Host) {
+    if (!same_phase) {
+        input::Pad neutral{};
+        neutral.connected = true;
+        synced_pads_[0] = neutral;
+        synced_pads_[1] = neutral;
+    } else if (role_.load(std::memory_order_relaxed) == Role::Host) {
         synced_pads_[0] = local_now.pad;
         synced_pads_[1] = remote_now.pad;
     } else {
@@ -601,22 +636,52 @@ bool Session::AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_has
     synced_pads_[1].connected = true;
 
     sub_frame_ticks_.store(0, std::memory_order_release);
+    rdtsc_sub_ticks_.store(0, std::memory_order_release);
+    if (same_phase) {
+        clock_frame_.fetch_add(1, std::memory_order_release);
+    }
     current_frame_.store(frame + 1, std::memory_order_release);
     return true;
 }
 
 uint64_t Session::GuestPerfCounter() {
     // 3,375,000 Hz / 60 FPS = 56,250 ticks per frame.
-    // A bounded sub-frame step ensures intra-frame spin loops observe monotonic progress
-    // while snapping to the exact frame boundary on every AdvanceFrame().
-    const uint64_t frame = current_frame_.load(std::memory_order_acquire);
-    const uint64_t sub = std::min<uint64_t>(sub_frame_ticks_.fetch_add(10, std::memory_order_relaxed), 56000ull);
+    // Per-thread sub-frame step ensures background threads never perturb the main simulation thread.
+    const uint64_t frame = clock_frame_.load(std::memory_order_acquire);
+    static thread_local const Session* tl_session = nullptr;
+    static thread_local uint64_t tl_frame = UINT64_MAX;
+    static thread_local uint64_t tl_sub = 0;
+    if (tl_session != this || tl_frame != frame) {
+        tl_session = this;
+        tl_frame = frame;
+        tl_sub = 0;
+    }
+    const uint64_t sub = std::min<uint64_t>(tl_sub, 56000ull);
+    tl_sub += 10;
     return (uint64_t(agreed_seed_.load(std::memory_order_relaxed) & 0xFFFFu) * 56250ull) + frame * 56250ull + sub;
+}
+
+uint64_t Session::GuestRdtsc() {
+    // 733,333,333 Hz / 60 FPS = 12,222,222 cycles per frame.
+    // Per-thread sub-frame increment keeps intra-frame RDTSC deltas and RNG seeding identical on both peers.
+    const uint64_t frame = clock_frame_.load(std::memory_order_acquire);
+    static thread_local const Session* tl_session = nullptr;
+    static thread_local uint64_t tl_frame = UINT64_MAX;
+    static thread_local uint64_t tl_sub = 0;
+    if (tl_session != this || tl_frame != frame) {
+        tl_session = this;
+        tl_frame = frame;
+        tl_sub = 0;
+    }
+    const uint64_t sub = std::min<uint64_t>(tl_sub, 12000000ull);
+    tl_sub += 733;
+    const uint64_t seed_base = uint64_t(agreed_seed_.load(std::memory_order_relaxed)) * 12222222ull;
+    return seed_base + (frame * 733333333ull) / 60ull + sub;
 }
 
 uint64_t Session::GuestInterruptTime100ns() const {
     // 10,000,000 (100ns units/sec) / 60 FPS = 166,666.666... units per frame.
-    const uint64_t frame = current_frame_.load(std::memory_order_acquire);
+    const uint64_t frame = clock_frame_.load(std::memory_order_acquire);
     return (frame * 500000ull) / 3ull;
 }
 
@@ -628,7 +693,7 @@ uint64_t Session::GuestSystemTime100ns() const {
 }
 
 uint32_t Session::GuestTickCountMs() const {
-    const uint64_t frame = current_frame_.load(std::memory_order_acquire);
+    const uint64_t frame = clock_frame_.load(std::memory_order_acquire);
     return uint32_t((frame * 50ull) / 3ull);
 }
 
@@ -683,6 +748,10 @@ uint64_t GuestPerfCounter() {
     return GlobalSession().GuestPerfCounter();
 }
 
+uint64_t GuestRdtsc() {
+    return GlobalSession().GuestRdtsc();
+}
+
 uint64_t GuestInterruptTime100ns() {
     return GlobalSession().GuestInterruptTime100ns();
 }
@@ -695,8 +764,8 @@ uint32_t GuestTickCountMs() {
     return GlobalSession().GuestTickCountMs();
 }
 
-bool AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash) {
-    return GlobalSession().AdvanceFrame(local_pad, local_state_hash);
+bool AdvanceFrame(const input::Pad& local_pad, uint32_t local_state_hash, bool in_gameplay) {
+    return GlobalSession().AdvanceFrame(local_pad, local_state_hash, in_gameplay);
 }
 
 input::Pad GetSyncedPad(int port) {

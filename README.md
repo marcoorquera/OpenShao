@@ -5,9 +5,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/OAleex/OpenShao/releases/latest"><img src="https://img.shields.io/badge/Download-Latest-2563eb?style=for-the-badge&amp;logo=github&amp;logoColor=white" alt="Download the latest release"></a>
-  <a href="https://github.com/OAleex/OpenShao/releases/latest"><img src="https://img.shields.io/github/v/release/OAleex/OpenShao?style=for-the-badge&amp;logo=github&amp;label=Latest%20release&amp;cacheSeconds=300" alt="Latest stable release"></a>
-  <a href="https://github.com/OAleex/OpenShao/releases"><img src="https://img.shields.io/github/downloads/OAleex/OpenShao/total?style=for-the-badge&amp;logo=github&amp;label=Release%20downloads" alt="Total GitHub release downloads"></a>
+  <a href="https://github.com/marcoorquera/OpenShao/releases/latest"><img src="https://img.shields.io/badge/Download-Latest-2563eb?style=for-the-badge&amp;logo=github&amp;logoColor=white" alt="Download the latest release"></a>
+  <a href="https://github.com/marcoorquera/OpenShao/releases/latest"><img src="https://img.shields.io/github/v/release/marcoorquera/OpenShao?style=for-the-badge&amp;logo=github&amp;label=Latest%20release&amp;cacheSeconds=300" alt="Latest stable release"></a>
+  <a href="https://github.com/marcoorquera/OpenShao/releases"><img src="https://img.shields.io/github/downloads/marcoorquera/OpenShao/total?style=for-the-badge&amp;logo=github&amp;label=Release%20downloads" alt="Total GitHub release downloads"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--2.0--or--later-blue?style=for-the-badge" alt="GPL-2.0-or-later license"></a>
 </p>
 
@@ -38,16 +38,35 @@ This fork builds on the upstream [OpenShao](https://github.com/OAleex/OpenShao) 
 
 ## Install
 
-### Windows and Linux (including SteamOS / Steam Deck)
+### Windows Release Installation
 
-1. Download or build the release package for your system (`Windows-x64.zip` or `Linux-x64.tar.gz`).
-2. Extract it to a folder.
-3. Open **OpenShao**.
-4. Choose your game: an ISO, XISO, ZIP, extracted folder or `default.xbe`.
-5. Select **Play**.
+1. Go to the [Releases](https://github.com/marcoorquera/OpenShao/releases) page and download the latest `OpenShao-*-Windows-x64.zip` package.
+2. Right-click the `.zip` archive and extract it to a folder on your PC (for example, `C:\Games\OpenShao`).
+3. Run `OpenShao.exe` once to open the launcher.
+4. Select your USA/Europe Xbox game copy (an ISO, XISO, ZIP, extracted folder or `default.xbe`).
+5. Click **Play** to start single-player or local Ko-op, or close the launcher to start a 2-PC LAN Netplay session below.
 
 Keep the game image or folder where it is. OpenShao reads it in place.
-On Steam Deck, you can run the native Linux build directly in Desktop Mode or add `OpenShao` as a Non-Steam Game to launch it from Gaming Mode.
+
+### 2-PC LAN / Peer-to-Peer Netplay Quick Start (Windows)
+
+1. Install the same Windows release `.zip` and configure the game in the launcher on **both PCs**.
+2. On **PC 1 (Host / Player 1)**, open PowerShell in the extracted `OpenShao` folder, check your local IP with `ipconfig`, and run:
+   ```powershell
+   .\OpenShao.exe --no-launcher --netplay-host 27886
+   ```
+   *(If Windows Defender Firewall prompts for access, allow UDP port `27886` on Private and Public networks.)*
+3. On **PC 2 (Client / Player 2)**, open PowerShell in the extracted `OpenShao` folder and connect using PC 1's IP address:
+   ```powershell
+   .\OpenShao.exe --no-launcher --netplay-join 192.168.1.50:27886
+   ```
+4. Both PCs will automatically handshake, synchronize clocks and inputs, and enter **Ko-op** or **Versus** together.
+
+### Linux (including SteamOS / Steam Deck)
+
+1. Download or build the `OpenShao-*-Linux-x64.tar.gz` package and extract it.
+2. Run `./OpenShao`, select your game copy, and click **Play**.
+3. On Steam Deck, run the native Linux build directly in Desktop Mode or add `OpenShao` as a Non-Steam Game to launch it from Gaming Mode.
 
 ## Update
 

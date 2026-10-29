@@ -335,20 +335,31 @@ uint32_t OpenOnDisc(''')
         '    if (code) openshao::paths::ReportError(L"The game stopped with error code " + std::to_wstring(code) + L".");\n    std::_Exit(code);')
     boot = replace_once(boot, "void Relaunch(const char* exe) {", "void Relaunch(const char* exe) {\n    if (openshao::options.background) { LOGE(\"Relaunch refused during isolated background test\"); Shutdown(50); }")
     (args.out / "boot.cpp").write_text(boot, encoding="utf-8")
+    dispatch_src = (args.sdk / "runtime/cpu/dispatch.cpp").read_text(encoding="utf-8")
+    dispatch_src = '#include "netplay.h"\n' + dispatch_src
+    dispatch_src = replace_once(dispatch_src, "uint64_t x86_rdtsc() {",
+        "uint64_t x86_rdtsc() {\n    if (openshao::netplay::IsActive()) return openshao::netplay::GuestRdtsc();")
+    (args.out / "dispatch.cpp").write_text(dispatch_src, encoding="utf-8")
     krnl = (args.sdk / "runtime/kernel/xboxkrnl.cpp").read_text(encoding="utf-8")
     krnl = '#include "netplay.h"\n' + krnl
     krnl = replace_once(krnl, "uint64_t InterruptTime() {",
         "uint64_t InterruptTime() {\n    if (openshao::netplay::IsActive()) return openshao::netplay::GuestInterruptTime100ns();")
+    krnl = replace_once(krnl, "void InitKernelData() {",
+        "void SyncNetplayKernelClocks() {\n"
+        "    if (!openshao::netplay::IsActive() || !g_tick_count_va) return;\n"
+        "    W32(g_tick_count_va, openshao::netplay::GuestTickCountMs());\n"
+        "    PutSystemTime(DataAddress(120), openshao::netplay::GuestInterruptTime100ns());\n"
+        "    PutSystemTime(DataAddress(154), openshao::netplay::GuestSystemTime100ns());\n"
+        "}\n"
+        "void InitKernelData() {")
+    krnl = replace_once(krnl, "    W32(DataAddress(157), 10000);  // 1 ms in 100 ns units",
+        "    W32(DataAddress(157), 10000);  // 1 ms in 100 ns units\n    SyncNetplayKernelClocks();")
     krnl = replace_once(krnl,
         "            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();\n"
         "            W32(g_tick_count_va, uint32_t(ms));\n"
         "            PutSystemTime(DataAddress(120), InterruptTime());\n"
         "            PutSystemTime(DataAddress(154), uint64_t(Now100ns()));",
-        "            if (openshao::netplay::IsActive()) {\n"
-        "                W32(g_tick_count_va, openshao::netplay::GuestTickCountMs());\n"
-        "                PutSystemTime(DataAddress(120), openshao::netplay::GuestInterruptTime100ns());\n"
-        "                PutSystemTime(DataAddress(154), openshao::netplay::GuestSystemTime100ns());\n"
-        "            } else {\n"
+        "            if (!openshao::netplay::IsActive()) {\n"
         "                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();\n"
         "                W32(g_tick_count_va, uint32_t(ms));\n"
         "                PutSystemTime(DataAddress(120), InterruptTime());\n"
@@ -379,6 +390,9 @@ uint32_t OpenOnDisc(''')
     # publication is consumed by this title's startup XGetDevices before it opens
     # handles; subsequent XGetDeviceChanges then never reports an insertion.
     xapi = replace_once(xapi, "    UpdatePorts();\n    if (!g_poller)", "    if (!g_poller)")
+    xapi = replace_once(xapi,
+        "                std::this_thread::sleep_for(std::chrono::milliseconds(250));\n                UpdatePorts();",
+        "                std::this_thread::sleep_for(std::chrono::milliseconds(250));\n                if (!openshao::netplay::IsActive()) UpdatePorts();")
     # The original main-menu callback stops when the character selector opens.
     # XInputGetState remains active on the guest thread. Switch ports before
     # the first state is returned to the new player, not on menu highlighting.
@@ -392,10 +406,10 @@ uint32_t OpenOnDisc(''')
     h.last = p;""")
     xapi += '\nX86_EXTERN_FUNC(__imp__sub_0048E398);\nX86_FUNC(sub_0048E398) {\n    const uint32_t handle = kernel::R32(ctx.esp + 4);\n    __imp__sub_0048E398(ctx, base);\n    LOGI("openshao input: original capabilities handle=%08X result=%u", handle, ctx.eax);\n}\n'
     xapi += '\nX86_EXTERN_FUNC(__imp__sub_0048E2A7);\nX86_FUNC(sub_0048E2A7) {\n    const uint32_t type = kernel::R32(ctx.esp + 4);\n    __imp__sub_0048E2A7(ctx, base);\n    LOGI("openshao input: enumeration type=%08X result=%u current=%u previous=%u", type, ctx.eax, kernel::R32(kGamepadType), kernel::R32(kGamepadType + 8));\n}\n'
-    xapi += '\nX86_EXTERN_FUNC(__imp__sub_0048E2C9);\nX86_FUNC(sub_0048E2C9) {\n    const uint32_t ins = kernel::R32(ctx.esp + 8), rem = kernel::R32(ctx.esp + 12);\n    __imp__sub_0048E2C9(ctx, base);\n    static unsigned n = 0;\n    if (n++ < 3 || ctx.eax) LOGI("openshao input: changes result=%u insert=%u remove=%u initial=%u", ctx.eax, kernel::R32(ins), kernel::R32(rem), kernel::R32(0x50FA88) & 255);\n}\n'
+    xapi += '\nX86_EXTERN_FUNC(__imp__sub_0048E2C9);\nX86_FUNC(sub_0048E2C9) {\n    if (openshao::netplay::IsActive() && openshao::netplay::CurrentFrame() >= 2) UpdatePorts();\n    const uint32_t ins = kernel::R32(ctx.esp + 8), rem = kernel::R32(ctx.esp + 12);\n    __imp__sub_0048E2C9(ctx, base);\n    static unsigned n = 0;\n    if (n++ < 3 || ctx.eax) LOGI("openshao input: changes result=%u insert=%u remove=%u initial=%u", ctx.eax, kernel::R32(ins), kernel::R32(rem), kernel::R32(0x50FA88) & 255);\n}\n'
     cap_begin = xapi.index('X86_FUNC(sub_0048E398) {')
     cap_end = xapi.index('\nX86_EXTERN_FUNC(__imp__sub_0048E2A7)', cap_begin)
-    xapi = '#include "controller.h"\n' + xapi[:cap_begin] + '#include "controller_compat.inl"\n' + xapi[cap_end:]
+    xapi = '#include "controller.h"\n#include "netplay.h"\n' + xapi[:cap_begin] + '#include "controller_compat.inl"\n' + xapi[cap_end:]
     # Reuse the actual override body in the synthetic packed-ABI regression.
     (args.out / "capabilities_test.inl").write_text('#include "controller_compat.inl"\n', encoding="utf-8")
     state_begin = xapi.index('HLE_STDCALL(XInputGetState, 2) {')
@@ -412,7 +426,7 @@ uint32_t OpenOnDisc(''')
     audio = replace_once(audio, "            render(b, kFrames);", "            render(b, kFrames);\n            openshao::scorpion::audio_preview::Mix(b, kFrames);")
     (args.out / "xaudio2.cpp").write_text(audio, encoding="utf-8")
     d3d = (args.sdk / "runtime/xdk/d3d8.cpp").read_text(encoding="utf-8")
-    d3d = '#include "aspect_ratio.h"\n#include "controller.h"\n#include "netplay.h"\n#include "sfd_lock_compat.h"\n#include "sfd_filter_compat.h"\n#include "vblank_compat.h"\n#include <array>\nstatic std::array<uint32_t, 13> g_openshao_present{};\n' + d3d
+    d3d = '#include "aspect_ratio.h"\n#include "controller.h"\n#include "netplay.h"\n#include "sfd_lock_compat.h"\n#include "sfd_filter_compat.h"\n#include "vblank_compat.h"\n#include <array>\nnamespace kernel { void SyncNetplayKernelClocks(); }\nstatic std::array<uint32_t, 13> g_openshao_present{};\n' + d3d
     # cstdint must precede the snapshot declaration when this TU is compiled alone.
     d3d = '#include "platform_compat.h"\n#include <cstdint>\n#include "core/diag.h"\n' + d3d
     d3d = replace_once(d3d, '    if (!h) h = 480;\n', '    if (!h) h = 480;\n    std::memcpy(g_openshao_present.data(), HostPtr(pp), sizeof(g_openshao_present));\n    g_openshao_present[0] = w; g_openshao_present[1] = h; g_openshao_present[3] = count;\n')
@@ -425,10 +439,37 @@ uint32_t OpenOnDisc(''')
     d3d = replace_once(d3d, '// what the library\'s vertical blank interrupt leaves for the title: count, event, callback',
         'static openshao::VBlankClock g_openshao_vblank;\n'
         '// what the library\'s vertical blank interrupt leaves for the title: count, event, callback')
-    d3d = replace_once(d3d, '        SetDev(XDK_CDevice_VBlankCount, count);',
-        '        SetDev(XDK_CDevice_VBlankCount, count);\n        g_openshao_vblank.Tick();')
+    d3d = replace_once(d3d,
+        '        uint32_t count = Dev(XDK_CDevice_VBlankCount) + 1, swaps = Dev(kDevSwapCount);\n'
+        '        SetDev(XDK_CDevice_VBlankCount, count);\n'
+        '        ObjectRef event = FromPointer(kDevice + XDK_CDevice_VBlankEvent);\n'
+        '        SetEvent(*event);\n'
+        '        if (uint32_t callback = Dev(XDK_CDevice_VBlankCallback)) {\n'
+        '            // blank count, swaps shown, 1 when this blank showed one\n'
+        '            W32(info, count);\n'
+        '            W32(info + 4, swaps);\n'
+        '            W32(info + 8, swaps != shown);\n'
+        '            CallGuest(ctx, callback, {info});\n'
+        '        }\n'
+        '        shown = swaps;',
+        '        uint32_t swaps = Dev(kDevSwapCount);\n'
+        '        if (!openshao::netplay::IsActive() || swaps != shown) {\n'
+        '            uint32_t count = openshao::netplay::IsActive() ? swaps : (Dev(XDK_CDevice_VBlankCount) + 1);\n'
+        '            SetDev(XDK_CDevice_VBlankCount, count);\n'
+        '            if (uint32_t callback = Dev(XDK_CDevice_VBlankCallback)) {\n'
+        '                W32(info, count);\n'
+        '                W32(info + 4, swaps);\n'
+        '                W32(info + 8, swaps != shown);\n'
+        '                CallGuest(ctx, callback, {info});\n'
+        '            }\n'
+        '            shown = swaps;\n'
+        '        }\n'
+        '        g_openshao_vblank.Tick();\n'
+        '        ObjectRef event = FromPointer(kDevice + XDK_CDevice_VBlankEvent);\n'
+        '        SetEvent(*event);')
     d3d = replace_once(d3d, 'HLE_STDCALL(D3DDevice_BlockUntilVerticalBlank, 0) {\n    std::this_thread::sleep_for(std::chrono::milliseconds(16));',
         'HLE_STDCALL(D3DDevice_BlockUntilVerticalBlank, 0) {\n'
+        '    if (openshao::netplay::IsActive()) return 0;\n'
         '    if constexpr (kVBlank) g_openshao_vblank.WaitNext();\n'
         '    else std::this_thread::sleep_for(std::chrono::milliseconds(16));')
     d3d = replace_once(d3d, 'HLE_STDCALL(D3DDevice_SetSoftDisplayFilter, 1) { return 0; }',
@@ -442,12 +483,20 @@ uint32_t OpenOnDisc(''')
     d3d = replace_once(d3d, '    g_presents++;',
         '    g_presents++;\n'
         '    if (openshao::netplay::IsActive()) {\n'
-        '        uint32_t state_hash = 0;\n'
-        '        if ((openshao::netplay::CurrentFrame() % 60u) == 0u) {\n'
-        '            state_hash = (R32(0x6C9308) * 2654435761u) ^ R32(0x598430 + 0x38) ^ R32(0x006394BC) ^ 0x5348414Fu;\n'
-        '            if (!state_hash) state_hash = 1;\n'
+        '        const uint32_t p1 = R32(0x64D230), p2 = R32(0x64D23C);\n'
+        '        const bool wad_loading = R32(0x695304) != 0;\n'
+        '        if (!wad_loading) {\n'
+        '            const bool in_gameplay = p1 != 0 && mem::IsCommitted(p1 + 0x88) && R32(p1 + 0x68) == 1;\n'
+        '            uint32_t state_hash = 0;\n'
+        '            if ((openshao::netplay::CurrentFrame() % 60u) == 0u) {\n'
+        '                const uint32_t p1_x = in_gameplay ? R32(p1 + 0x80) : 0u;\n'
+        '                const uint32_t p2_x = (in_gameplay && p2 && mem::IsCommitted(p2 + 0x88)) ? R32(p2 + 0x80) : 0u;\n'
+        '                state_hash = (R32(0x6C9308) * 2654435761u) ^ R32(0x598430 + 0x38) ^ R32(0x505970) ^ p1_x ^ p2_x ^ 0x5348414Fu;\n'
+        '                if (!state_hash) state_hash = 1;\n'
+        '            }\n'
+        '            openshao::netplay::AdvanceFrame(openshao::controller::PollLocal(), state_hash, in_gameplay);\n'
+        '            kernel::SyncNetplayKernelClocks();\n'
         '        }\n'
-        '        openshao::netplay::AdvanceFrame(openshao::controller::PollLocal(), state_hash);\n'
         '    }\n'
         '    { static uint64_t last_tick=0; static uint32_t last_swap=0;\n'
         '      const uint64_t tick=GetTickCount64();\n'
@@ -457,6 +506,9 @@ uint32_t OpenOnDisc(''')
         '               R32(0x006394BC));\n'
         '          last_tick=tick; last_swap=g_presents.load();\n'
         '      } }')
+    d3d = replace_once(d3d,
+        '    uint32_t n = Dev(kDevSwapCount) + 1;\n    SetDev(kDevSwapCount, n);',
+        '    uint32_t n = Dev(kDevSwapCount) + 1;\n    SetDev(kDevSwapCount, n);\n    if (openshao::netplay::IsActive() && kVBlank) SetDev(XDK_CDevice_VBlankCount, n);')
     d3d = replace_once(d3d, 'if (!(handle & 1) && (handle & 0xE) == 4) LOG_FIRST(1, "d3d: pretransformed immediate mode vertices are not supported");', 'if (!(handle & 1) && (handle & 0xE) == 4) LOG_FIRST(1, "openshao d3d: screen-coordinate immediate vertices");')
     # The original SetRenderTarget reaches SetViewport through
     # D3D_CommonSetMultiSampleModeAndScale. Match SetViewport's clipping reset.

@@ -3,7 +3,7 @@
 # top-level CMakeLists.txt after code generation and runtime adaptation.
 find_package(Threads REQUIRED)
 
-set(OPENSHAO_LINUX_EXCLUDE "/kernel/(files|xboxkrnl)\\.cpp$|/app/[a-z_]+\\.cpp$|/core/input\\.cpp$|/audio/xaudio2\\.cpp$|/gpu/(d3d12|vertex|shaders|render_thread)\\.cpp$|/xdk/(d3d8|xapi|dsound|xnet)\\.cpp$")
+set(OPENSHAO_LINUX_EXCLUDE "/cpu/dispatch\\.cpp$|/kernel/(files|xboxkrnl)\\.cpp$|/app/[a-z_]+\\.cpp$|/core/input\\.cpp$|/audio/xaudio2\\.cpp$|/gpu/(d3d12|vertex|shaders|render_thread)\\.cpp$|/xdk/(d3d8|xapi|dsound|xnet)\\.cpp$")
 list(FILTER XBE_RUNTIME_SOURCES EXCLUDE REGEX "${OPENSHAO_LINUX_EXCLUDE}")
 
 set(OPENSHAO_IMGUI_CORE
@@ -42,7 +42,7 @@ set(OPENSHAO_LINUX_SOURCES
     "${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp")
 
 add_executable(OpenShao ${XBE_RUNTIME_SOURCES} ${OPENSHAO_IMGUI_CORE} ${GEN_SOURCES}
-    "${HOST_ADAPTED}/boot.cpp" "${HOST_ADAPTED}/xboxkrnl.cpp" "${HOST_ADAPTED}/d3d8.cpp" "${HOST_ADAPTED}/xapi.cpp" "${HOST_ADAPTED}/dsound.cpp"
+    "${HOST_ADAPTED}/boot.cpp" "${HOST_ADAPTED}/dispatch.cpp" "${HOST_ADAPTED}/xboxkrnl.cpp" "${HOST_ADAPTED}/d3d8.cpp" "${HOST_ADAPTED}/xapi.cpp" "${HOST_ADAPTED}/dsound.cpp"
     "${HOST_ADAPTED}/vertex.cpp" "${HOST_ADAPTED}/shaders.cpp" "${HOST_ADAPTED}/files.cpp" "${HOST_ADAPTED}/settings.cpp"
     "${HOST_ADAPTED}/render_thread.cpp"
     ${OPENSHAO_SHARED_SOURCES} ${OPENSHAO_LINUX_SOURCES} "${CMAKE_CURRENT_BINARY_DIR}/openshao_xbe.cpp")
