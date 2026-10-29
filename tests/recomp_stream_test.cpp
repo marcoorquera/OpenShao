@@ -1,8 +1,10 @@
 #include "stream.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 using namespace openshao::stream;
@@ -115,6 +117,78 @@ int main() {
         Check(!a.Add(Chunk(1, frame, 0), frame.data(), kMaxChunk - 1, out), "short chunk is rejected");
     }
 
-    std::puts("PASS: stream packet framing, chunking and frame reassembly");
+    // 8. Opus encode/decode round trip with 1 kHz sine, single-packet loss (FEC) and burst loss (PLC cap)
+    {
+        constexpr uint32_t kTotalFrames = 50;
+        constexpr uint32_t kTotalSamples = kTotalFrames * kAudioPacketFrames;
+        std::vector<float> sine(size_t(kTotalSamples) * 2);
+        for (uint32_t i = 0; i < kTotalSamples; ++i) {
+            const float v = 0.5f * std::sin(2.0f * 3.14159265358979323846f * 1000.0f * float(i) / float(kAudioRate));
+            sine[size_t(i) * 2] = v;
+            sine[size_t(i) * 2 + 1] = -v;
+        }
+
+        AudioEncoder encoder;
+        Check(!encoder.Submit(sine.data(), kAudioPacketFrames, 44100, [](const AudioChunk&, const uint8_t*, size_t) {}),
+              "non-48 kHz audio rate is rejected");
+
+        std::vector<std::pair<AudioChunk, std::vector<uint8_t>>> packets;
+        // Feed in non-480 increments to verify accumulation across calls.
+        uint32_t offset = 0;
+        const uint32_t step = 300;
+        while (offset < kTotalSamples) {
+            const uint32_t count = std::min(step, kTotalSamples - offset);
+            const bool ok = encoder.Submit(
+                sine.data() + size_t(offset) * 2, count, kAudioRate,
+                [&](const AudioChunk& chunk, const uint8_t* data, size_t size) {
+                    packets.emplace_back(chunk, std::vector<uint8_t>(data, data + size));
+                });
+            Check(ok, "48 kHz Opus encoding succeeds");
+            offset += count;
+        }
+        Check(packets.size() == kTotalFrames, "50 Opus packets are produced from 50x480 input frames");
+        for (uint32_t i = 0; i < kTotalFrames; ++i) {
+            const auto& chunk = packets[i].first;
+            Check(chunk.rate == kAudioRate && chunk.frames == kAudioPacketFrames &&
+                  chunk.codec == kAudioCodecOpus && chunk.index == i && !packets[i].second.empty(),
+                  "Opus chunk metadata and index sequence");
+        }
+
+        AudioDecoder decoder;
+        std::vector<int16_t> pcm;
+        for (uint32_t i = 0; i < kTotalFrames; ++i) {
+            if (i == 20) continue; // drop frame 20
+            Check(decoder.Decode(packets[i].first, packets[i].second.data(), packets[i].second.size(), pcm),
+                  "Opus packet decodes (with FEC on gap of 1)");
+        }
+        Check(pcm.size() == size_t(kTotalSamples) * 2, "output frame count matches 50 frames after 1-packet loss");
+
+        auto frame_energy = [&](uint32_t frame_index) {
+            uint64_t sum = 0;
+            const size_t base = size_t(frame_index) * kAudioPacketFrames * 2;
+            for (size_t i = 0; i < kAudioPacketFrames * 2; ++i) {
+                const int64_t s = pcm[base + i];
+                sum += uint64_t(s * s);
+            }
+            return sum;
+        };
+        Check(frame_energy(20) > 0, "concealed frame 20 has non-zero energy");
+        uint64_t post_loss_energy = 0;
+        for (uint32_t f = 21; f < kTotalFrames; ++f) post_loss_energy += frame_energy(f);
+        Check(post_loss_energy > 0, "decoded audio after frame 20 loss has non-zero energy");
+
+        // Larger gap: dropping 6 packets conceals at most 3 frames with PLC, then resyncs.
+        decoder.Reset();
+        pcm.clear();
+        for (uint32_t i = 0; i < 10; ++i)
+            Check(decoder.Decode(packets[i].first, packets[i].second.data(), packets[i].second.size(), pcm),
+                  "initial packets before burst loss decode");
+        Check(decoder.Decode(packets[16].first, packets[16].second.data(), packets[16].second.size(), pcm),
+              "packet after 6-frame gap triggers capped PLC and resyncs");
+        Check(pcm.size() == size_t(10 + kMaxPlcFrames + 1) * kAudioPacketFrames * 2,
+              "burst loss conceals at most 3 PLC frames before resyncing");
+    }
+
+    std::puts("PASS: stream packet framing, chunking, frame reassembly and Opus audio");
     return 0;
 }

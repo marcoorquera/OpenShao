@@ -57,7 +57,7 @@ set_source_files_properties(src/linux/linux_main.cpp PROPERTIES COMPILE_DEFINITI
 target_compile_options(OpenShao PRIVATE -fno-strict-aliasing -march=x86-64-v2)
 # libstdc++ and libgcc go into the executable: the player's distribution only has to supply glibc
 target_link_options(OpenShao PRIVATE -fuse-ld=lld -static-libstdc++ -static-libgcc)
-target_link_libraries(OpenShao PRIVATE openshao_mods miniz tomlplusplus::tomlplusplus SDL3::SDL3-static Threads::Threads
+target_link_libraries(OpenShao PRIVATE openshao_mods miniz opus tomlplusplus::tomlplusplus SDL3::SDL3-static Threads::Threads
     Vulkan::Headers glslang::glslang glslang::glslang-default-resource-limits ${CMAKE_DL_LIBS})
 
 # Regression tests that do not depend on Windows.
@@ -81,7 +81,7 @@ openshao_linux_test(recomp_language_pack SOURCES tests/recomp_language_pack_test
 openshao_linux_test(recomp_launcher_settings SOURCES tests/recomp_launcher_settings_test.cpp src/launcher_settings.cpp LIBS tomlplusplus::tomlplusplus)
 openshao_linux_test(recomp_mouse SOURCES tests/recomp_mouse_test.cpp src/mouse_state.cpp)
 openshao_linux_test(recomp_netplay SOURCES tests/recomp_netplay_test.cpp src/netplay.cpp LIBS Threads::Threads)
-openshao_linux_test(recomp_stream SOURCES tests/recomp_stream_test.cpp src/stream_protocol.cpp)
+openshao_linux_test(recomp_stream SOURCES tests/recomp_stream_test.cpp src/stream_protocol.cpp LIBS opus)
 openshao_linux_test(recomp_sfd_lock SOURCES tests/recomp_sfd_lock_test.cpp)
 openshao_linux_test(recomp_vblank SOURCES tests/recomp_vblank_test.cpp)
 openshao_linux_test(recomp_input_mode SOURCES tests/recomp_input_mode_test.cpp)

@@ -1,8 +1,115 @@
 #include "stream.h"
 
+#include <opus.h>
+
 #include <cstring>
 
 namespace openshao::stream {
+
+AudioEncoder::~AudioEncoder() {
+    Reset();
+}
+
+void AudioEncoder::Reset() {
+    if (encoder_) {
+        opus_encoder_destroy(encoder_);
+        encoder_ = nullptr;
+    }
+    rate_ = 0;
+    buffered_ = 0;
+}
+
+bool AudioEncoder::Prepare(uint32_t rate) {
+    if (rate != rate_) {
+        if (encoder_) {
+            opus_encoder_destroy(encoder_);
+            encoder_ = nullptr;
+        }
+        buffered_ = 0;
+        rate_ = rate;
+    }
+    if (rate != kAudioRate) return false;
+    if (!encoder_) {
+        int err = OPUS_OK;
+        encoder_ = opus_encoder_create(opus_int32(kAudioRate), 2, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
+        if (!encoder_ || err != OPUS_OK) {
+            if (encoder_) opus_encoder_destroy(encoder_);
+            encoder_ = nullptr;
+            return false;
+        }
+        opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(opus_int32(kAudioBitrate)));
+        opus_encoder_ctl(encoder_, OPUS_SET_COMPLEXITY(5));
+        opus_encoder_ctl(encoder_, OPUS_SET_INBAND_FEC(1));
+        opus_encoder_ctl(encoder_, OPUS_SET_PACKET_LOSS_PERC(5));
+    }
+    return true;
+}
+
+size_t AudioEncoder::EncodeFrame(AudioChunk& chunk, uint8_t* out, size_t max_size) {
+    if (!encoder_) return 0;
+    const int bytes = opus_encode_float(encoder_, pcm_.data(), int(kAudioPacketFrames), out, opus_int32(max_size));
+    if (bytes <= 0) return 0;
+    chunk.rate = rate_;
+    chunk.frames = uint16_t(kAudioPacketFrames);
+    chunk.codec = kAudioCodecOpus;
+    chunk.index = index_++;
+    return size_t(bytes);
+}
+
+AudioDecoder::~AudioDecoder() {
+    Reset();
+}
+
+void AudioDecoder::Reset() {
+    if (decoder_) {
+        opus_decoder_destroy(decoder_);
+        decoder_ = nullptr;
+    }
+    expected_index_ = 0;
+    has_index_ = false;
+}
+
+bool AudioDecoder::Prepare(const AudioChunk& chunk, const uint8_t* data, size_t size, uint32_t& gap) {
+    if (chunk.codec != kAudioCodecOpus || chunk.rate != kAudioRate || chunk.frames != kAudioPacketFrames || !data || !size)
+        return false;
+    if (!decoder_) {
+        int err = OPUS_OK;
+        decoder_ = opus_decoder_create(opus_int32(kAudioRate), 2, &err);
+        if (!decoder_ || err != OPUS_OK) {
+            if (decoder_) opus_decoder_destroy(decoder_);
+            decoder_ = nullptr;
+            return false;
+        }
+    }
+    if (!has_index_) {
+        gap = 0;
+    } else {
+        const int32_t diff = int32_t(chunk.index - expected_index_);
+        // A late duplicate is dropped; a large step back means the host restarted its counter.
+        if (diff < 0 && diff > -int32_t(kAudioResyncPackets)) return false;
+        gap = diff < 0 ? 0 : uint32_t(diff);
+    }
+    return true;
+}
+
+bool AudioDecoder::DecodeFrame(const uint8_t* data, size_t size, bool fec, int16_t* out) {
+    if (!decoder_ || !out) return false;
+    const int frames = opus_decode(decoder_, data, opus_int32(size), out, int(kAudioPacketFrames), fec ? 1 : 0);
+    return frames == int(kAudioPacketFrames);
+}
+
+void AudioDecoder::AdvanceIndex(uint32_t index) {
+    has_index_ = true;
+    expected_index_ = index + 1;
+}
+
+bool AudioDecoder::Decode(const AudioChunk& chunk, const uint8_t* data, size_t size, std::vector<int16_t>& out) {
+    std::array<int16_t, kAudioPacketFrames * 2> frame{};
+    return Decode(
+        chunk, data, size,
+        [&]() { return frame.data(); },
+        [&](const int16_t* pcm) { out.insert(out.end(), pcm, pcm + frame.size()); });
+}
 
 bool ParsePacket(const uint8_t* data, size_t size, Header& header, const uint8_t*& payload) {
     if (size < sizeof(Header)) return false;

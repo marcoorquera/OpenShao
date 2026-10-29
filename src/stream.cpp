@@ -63,7 +63,8 @@ using Microsoft::WRL::ComPtr;
 constexpr float kJpegQuality = 0.85f;
 constexpr uint32_t kInputIntervalMs = 8;
 constexpr uint32_t kHelloIntervalMs = 250;
-constexpr uint32_t kMaxQueuedAudio = 12; // 60 ms of 5 ms packets
+constexpr uint32_t kPrefillAudio = 3;    // 30 ms of 10 ms packets
+constexpr uint32_t kMaxQueuedAudio = 12; // 120 ms of 10 ms packets
 constexpr uint32_t kAudioSlots = 64;
 
 uint32_t NowMs() {
@@ -204,19 +205,23 @@ struct Host {
     bool frame_ready = false;
     uint32_t frame_id = 0;
 
-    std::vector<int16_t> audio;
+    AudioEncoder audio;
 };
 Host g_host;
 
-void HostSend(const std::vector<uint8_t>& packet) {
+void HostSend(const void* data, size_t size) {
     sockaddr_in to;
     {
         std::lock_guard guard(g_host.peer_lock);
         if (!g_host.connected.load(std::memory_order_acquire)) return;
         to = g_host.peer;
     }
-    sendto(g_host.sock, reinterpret_cast<const char*>(packet.data()), int(packet.size()), 0,
+    sendto(g_host.sock, static_cast<const char*>(data), int(size), 0,
            reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+}
+
+void HostSend(const std::vector<uint8_t>& packet) {
+    HostSend(packet.data(), packet.size());
 }
 
 void HostDisconnect(const char* reason) {
@@ -322,6 +327,8 @@ struct Client {
     IXAudio2MasteringVoice* master = nullptr;
     IXAudio2SourceVoice* voice = nullptr;
     uint32_t audio_rate = 0;
+    bool audio_playing = false;
+    AudioDecoder audio;
     std::vector<int16_t> audio_slots;
     uint32_t audio_next = 0;
 
@@ -337,12 +344,15 @@ void ClientSend(Client& c, PacketType type, uint32_t seq, const void* payload = 
 }
 
 void ClientAudio(Client& c, const AudioChunk& chunk, const uint8_t* samples, size_t size) {
-    if (!chunk.frames || chunk.frames > kAudioPacketFrames || size != size_t(chunk.frames) * 4) return;
+    if (chunk.codec != kAudioCodecOpus || chunk.rate != kAudioRate || chunk.frames != kAudioPacketFrames || !size)
+        return;
     if (!c.voice || c.audio_rate != chunk.rate) {
         if (c.voice) {
             c.voice->DestroyVoice();
             c.voice = nullptr;
         }
+        c.audio.Reset();
+        c.audio_playing = false;
         WAVEFORMATEX wf{};
         wf.wFormatTag = WAVE_FORMAT_PCM;
         wf.nChannels = 2;
@@ -356,18 +366,32 @@ void ClientAudio(Client& c, const AudioChunk& chunk, const uint8_t* samples, siz
             return;
         }
         c.audio_rate = chunk.rate;
-        c.voice->Start();
     }
-    XAUDIO2_VOICE_STATE state;
+    XAUDIO2_VOICE_STATE state{};
     c.voice->GetState(&state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    // Dropping a packet keeps the delay bounded when the host clock runs slightly faster.
-    if (state.BuffersQueued >= kMaxQueuedAudio) return;
-    int16_t* slot = &c.audio_slots[size_t(c.audio_next++ % kAudioSlots) * kAudioPacketFrames * 2];
-    std::memcpy(slot, samples, size);
-    XAUDIO2_BUFFER buffer{};
-    buffer.AudioBytes = UINT32(size);
-    buffer.pAudioData = reinterpret_cast<const BYTE*>(slot);
-    c.voice->SubmitSourceBuffer(&buffer);
+    uint32_t queued = state.BuffersQueued;
+    if (c.audio_playing && queued == 0) {
+        c.voice->Stop();
+        c.audio_playing = false;
+    }
+    c.audio.Decode(
+        chunk, samples, size,
+        [&]() -> int16_t* {
+            return &c.audio_slots[size_t(c.audio_next % kAudioSlots) * kAudioPacketFrames * 2];
+        },
+        [&](const int16_t* slot) {
+            ++c.audio_next;
+            // Dropping a packet keeps the delay bounded when the host clock runs slightly faster.
+            if (queued >= kMaxQueuedAudio) return;
+            XAUDIO2_BUFFER buffer{};
+            buffer.AudioBytes = kAudioPacketFrames * 2 * sizeof(int16_t);
+            buffer.pAudioData = reinterpret_cast<const BYTE*>(slot);
+            if (SUCCEEDED(c.voice->SubmitSourceBuffer(&buffer))) ++queued;
+        });
+    if (!c.audio_playing && queued >= kPrefillAudio) {
+        c.voice->Start();
+        c.audio_playing = true;
+    }
 }
 
 void ClientNetwork(Client& c) {
@@ -387,6 +411,7 @@ void ClientNetwork(Client& c) {
         const auto type = PacketType(header.type);
         if (type == PacketType::Welcome) {
             if (!c.connected.exchange(true)) {
+                c.audio.Reset();
                 LOGI("stream: connected to host %s", AddressText(c.host).c_str());
                 PostMessageW(c.window, WM_APP + 1, 0, 0);
             }
@@ -408,6 +433,7 @@ void ClientNetwork(Client& c) {
             std::memcpy(&chunk, payload, sizeof(chunk));
             ClientAudio(c, chunk, payload + sizeof(chunk), header.size - sizeof(chunk));
         } else if (type == PacketType::Bye) {
+            c.audio.Reset();
             if (c.connected.exchange(false)) LOGI("stream: host closed the session");
             PostMessageW(c.window, WM_APP + 1, 0, 0);
         }
@@ -618,19 +644,20 @@ void SubmitVideo(const uint8_t* bgra, uint32_t width, uint32_t height, uint32_t 
 }
 
 void SubmitAudio(const float* stereo, uint32_t frames, uint32_t rate) {
-    if (!g_host.connected.load(std::memory_order_acquire)) return;
-    auto& pcm = g_host.audio;
-    for (uint32_t offset = 0; offset < frames; offset += kAudioPacketFrames) {
-        const uint32_t count = std::min(kAudioPacketFrames, frames - offset);
-        pcm.resize(size_t(count) * 2);
-        for (size_t i = 0; i < pcm.size(); ++i) {
-            const float v = std::clamp(stereo[size_t(offset) * 2 + i], -1.0f, 1.0f);
-            pcm[i] = int16_t(v * 32767.0f);
-        }
-        AudioChunk chunk{};
-        chunk.rate = rate;
-        chunk.frames = uint16_t(count);
-        HostSend(BuildPacket(PacketType::Audio, g_host.seq++, &chunk, sizeof(chunk), pcm.data(), pcm.size() * 2));
+    if (!g_host.connected.load(std::memory_order_acquire) || !stereo || !frames) return;
+    if (!g_host.audio.Submit(stereo, frames, rate, [](const AudioChunk& chunk, const uint8_t* data, size_t size) {
+            std::array<uint8_t, sizeof(Header) + sizeof(AudioChunk) + kMaxChunk> packet{};
+            Header header{};
+            header.type = uint8_t(PacketType::Audio);
+            header.size = uint16_t(sizeof(AudioChunk) + size);
+            header.seq = g_host.seq++;
+            std::memcpy(packet.data(), &header, sizeof(Header));
+            std::memcpy(packet.data() + sizeof(Header), &chunk, sizeof(AudioChunk));
+            std::memcpy(packet.data() + sizeof(Header) + sizeof(AudioChunk), data, size);
+            HostSend(packet.data(), sizeof(Header) + sizeof(AudioChunk) + size);
+        })) {
+        if (rate != kAudioRate) LOG_FIRST(1, "stream: unsupported audio sample rate %u Hz", unsigned(rate));
+        else LOG_FIRST(1, "stream: audio encoder initialization failed");
     }
 }
 
