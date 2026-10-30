@@ -125,6 +125,10 @@ void BgraToNv12(const uint8_t* bgra, uint32_t pitch, uint32_t width, uint32_t he
                 std::vector<uint8_t>& nv12, uint32_t& out_width, uint32_t& out_height);
 void Nv12ToBgra(const uint8_t* y, const uint8_t* uv, uint32_t pitch, uint32_t width, uint32_t height,
                 std::vector<uint8_t>& bgra);
+// Copies NV12 planes into one buffer without row padding: width x height luma, then
+// width x height / 2 bytes of interleaved chroma. width and height must be even.
+void PackNv12(const uint8_t* y, const uint8_t* uv, uint32_t pitch, uint32_t width, uint32_t height,
+              std::vector<uint8_t>& nv12);
 
 // Round-trip time shown to Player 2, smoothed so a single late reply does not make it jump.
 class PingFilter {

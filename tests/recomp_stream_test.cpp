@@ -468,6 +468,18 @@ int main() {
         Check(reset.packets_expected == 1 && reset.packets_received == 1, "Reset starts a new count");
     }
 
+    // 12a. PackNv12 drops row padding and keeps the chroma rows
+    {
+        const uint32_t w = 4, h = 4, pitch = 6;
+        std::vector<uint8_t> y(pitch * h), uv(pitch * h / 2), packed;
+        for (size_t i = 0; i < y.size(); ++i) y[i] = uint8_t(i);
+        for (size_t i = 0; i < uv.size(); ++i) uv[i] = uint8_t(100 + i);
+        PackNv12(y.data(), uv.data(), pitch, w, h, packed);
+        Check(packed.size() == w * h * 3 / 2, "packed NV12 has no padding");
+        Check(packed[0] == 0 && packed[3] == 3 && packed[4] == 6 && packed[15] == 21, "luma rows skip the pitch padding");
+        Check(packed[16] == 100 && packed[19] == 103 && packed[20] == 106 && packed[23] == 109, "chroma rows skip the pitch padding");
+    }
+
     // 12b. PingFilter smoothing
     {
         PingFilter ping;

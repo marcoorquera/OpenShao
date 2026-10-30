@@ -3,6 +3,7 @@
 #include "stream_invite.h"
 #include "stream_upnp.h"
 #include "stream_video.h"
+#include "stream_view.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -417,6 +418,12 @@ struct Client {
     std::atomic<uint32_t> paints{0};
     std::atomic<uint32_t> seq{0};
 
+    // With a GPU viewer, frames stay NV12 and a render thread presents them; without it, the network
+    // thread converts to BGRA and the window paints with GDI.
+    std::unique_ptr<ViewRenderer> view;
+    std::condition_variable render_cv;
+    bool redraw = false;  // guarded by frame_lock
+
     IXAudio2* xaudio = nullptr;
     IXAudio2MasteringVoice* master = nullptr;
     IXAudio2SourceVoice* voice = nullptr;
@@ -499,12 +506,59 @@ void ClientAudio(Client& c, const AudioChunk& chunk, const uint8_t* samples, siz
     }
 }
 
+void RequestRedraw(Client& c) {
+    if (!c.view) {
+        InvalidateRect(c.window, nullptr, FALSE);
+        return;
+    }
+    {
+        std::lock_guard guard(c.frame_lock);
+        c.redraw = true;
+    }
+    c.render_cv.notify_one();
+}
+
+void ClientRender(Client& c) {
+    std::vector<uint8_t> nv12;
+    uint32_t w = 0, h = 0;
+    float aspect = 4.f / 3.f;
+    while (c.running.load(std::memory_order_acquire)) {
+        bool fresh = false;
+        {
+            std::unique_lock guard(c.frame_lock);
+            // The timeout also follows window size changes while the picture is still.
+            c.render_cv.wait_for(guard, std::chrono::milliseconds(250), [&] {
+                return c.frame_new || c.redraw || !c.running.load(std::memory_order_acquire);
+            });
+            if (!c.running.load(std::memory_order_acquire)) break;
+            if (c.frame_new) {
+                nv12.swap(c.frame);
+                w = c.frame_w;
+                h = c.frame_h;
+                aspect = c.frame_aspect;
+                c.frame_new = false;
+                fresh = true;
+            }
+            c.redraw = false;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const int ping = c.connected.load(std::memory_order_acquire) ? int(c.ping_ms.load(std::memory_order_acquire)) : -1;
+        if (!c.view->Draw(fresh ? nv12.data() : nullptr, w, h, aspect, ping)) LOG_FIRST(1, "stream: the viewer could not draw a frame");
+        if (!fresh) continue;
+        const uint32_t us = uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count());
+        c.paint_us.fetch_add(us, std::memory_order_relaxed);
+        c.paints.fetch_add(1, std::memory_order_relaxed);
+        if (us > c.paint_max_us.load(std::memory_order_relaxed)) c.paint_max_us.store(us, std::memory_order_relaxed);
+    }
+}
+
 void ClientNetwork(Client& c) {
     ComScope com(COINIT_MULTITHREADED);
     const bool media = StartMediaFoundation();
     VideoDecoder decoder;
     FrameAssembler assembler;
-    std::vector<uint8_t> buffer(2048), encoded, pixels;
+    std::vector<uint8_t> buffer(2048), encoded, pixels, bgra;
     // Until a keyframe arrives, predicted frames would only show corrupted pictures.
     bool waiting_keyframe = true;
     bool has_frame = false;
@@ -640,6 +694,11 @@ void ClientNetwork(Client& c) {
                 }
                 continue;
             }
+            if (!c.view) {
+                Nv12ToBgra(pixels.data(), pixels.data() + size_t(chunk.width) * chunk.height, chunk.width,
+                           chunk.width, chunk.height, bgra);
+                pixels.swap(bgra);
+            }
             {
                 std::lock_guard guard(c.frame_lock);
                 c.frame.swap(pixels);
@@ -648,7 +707,7 @@ void ClientNetwork(Client& c) {
                 c.frame_aspect = chunk.aspect ? float(chunk.aspect) / 1000.f : 4.f / 3.f;
                 c.frame_new = true;
             }
-            InvalidateRect(c.window, nullptr, FALSE);
+            RequestRedraw(c);
         } else if (type == PacketType::Pong && header.size == sizeof(PingPayload)) {
             PingPayload reply;
             std::memcpy(&reply, payload, sizeof(reply));
@@ -657,7 +716,7 @@ void ClientNetwork(Client& c) {
             if (rtt <= kPeerTimeoutMs) {
                 c.ping_ms.store(int32_t(ping.Add(rtt)), std::memory_order_release);
                 // Keeps the value current while the picture is still, when no frame triggers a repaint.
-                InvalidateRect(c.window, nullptr, FALSE);
+                RequestRedraw(c);
             }
         } else if (type == PacketType::Audio && header.size > sizeof(AudioChunk)) {
             AudioChunk chunk;
@@ -804,13 +863,19 @@ LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
-        if (c) Paint(*c, dc);
+        if (c && !c->view) Paint(*c, dc);
         EndPaint(hwnd, &ps);
+        if (c && c->view) RequestRedraw(*c);
         return 0;
     }
+    case WM_SIZE:
+        if (c && c->view) RequestRedraw(*c);
+        break;
     case WM_APP + 1:
-        if (c) ClientTitle(*c);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        if (c) {
+            ClientTitle(*c);
+            RequestRedraw(*c);
+        }
         return 0;
     case WM_SYSKEYDOWN:
         if (wp == VK_RETURN && (lp & (1 << 29))) {
@@ -1171,12 +1236,22 @@ int RunClient(const std::string& host, uint16_t port) {
     }
     ClientTitle(c);
     ShowWindow(c.window, SW_SHOW);
+    auto view = std::make_unique<ViewRenderer>();
+    std::string view_error;
+    if (view->Open(c.window, view_error)) {
+        c.view = std::move(view);
+        LOGI("stream: the viewer draws with Direct3D 11");
+    } else {
+        LOGW("stream: %s; the viewer draws with GDI", view_error.c_str());
+    }
     if (c.ice) LOGI("stream: connecting to the host over the internet");
     else LOGI("stream: connecting to host %s", AddressText(c.host).c_str());
 
     std::thread net(ClientNetwork, std::ref(c));
     // Input has its own thread so that slow drawing in full screen never delays Player 2's buttons.
     std::thread input(ClientInput, std::ref(c));
+    std::thread render;
+    if (c.view) render = std::thread(ClientRender, std::ref(c));
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
@@ -1186,6 +1261,9 @@ int RunClient(const std::string& host, uint16_t port) {
     input.join();
     for (int i = 0; i < 3; ++i) ClientSend(c, PacketType::Bye, c.seq++);
     net.join();
+    c.render_cv.notify_all();
+    if (render.joinable()) render.join();
+    c.view.reset();
     SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
     if (c.voice) c.voice->DestroyVoice();
     if (c.master) c.master->DestroyVoice();
