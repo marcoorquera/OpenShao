@@ -428,7 +428,7 @@ struct VideoDecoder::State {
     }
 
     // Returns S_OK with a converted frame, MF_E_TRANSFORM_NEED_MORE_INPUT when empty, or an error.
-    HRESULT Output(uint32_t width, uint32_t height, std::vector<uint8_t>& bgra) {
+    HRESULT Output(uint32_t width, uint32_t height, std::vector<uint8_t>& nv12) {
         for (int attempt = 0; attempt < 3; ++attempt) {
             MFT_OUTPUT_DATA_BUFFER ob{};
             ComPtr<IMFSample> own;
@@ -454,16 +454,16 @@ struct VideoDecoder::State {
                 DWORD length = 0;
                 if (SUCCEEDED(buffer.As(&buffer2d)) && SUCCEEDED(buffer2d->Lock2D(&data, &pitch))) {
                     if (pitch > 0) {
-                        Nv12ToBgra(data, data + size_t(pitch) * buffer_h, uint32_t(pitch),
-                                   std::min(width, buffer_w), std::min(height, buffer_h), bgra);
+                        PackNv12(data, data + size_t(pitch) * buffer_h, uint32_t(pitch),
+                                 std::min(width, buffer_w), std::min(height, buffer_h), nv12);
                         result = S_OK;
                     }
                     buffer2d->Unlock2D();
                 } else if (SUCCEEDED(buffer->Lock(&data, nullptr, &length))) {
                     const uint32_t p = uint32_t(stride > 0 ? stride : int32_t(buffer_w));
                     if (size_t(p) * buffer_h * 3 / 2 <= length) {
-                        Nv12ToBgra(data, data + size_t(p) * buffer_h, p, std::min(width, buffer_w),
-                                   std::min(height, buffer_h), bgra);
+                        PackNv12(data, data + size_t(p) * buffer_h, p, std::min(width, buffer_w),
+                                 std::min(height, buffer_h), nv12);
                         result = S_OK;
                     }
                     buffer->Unlock();
@@ -484,7 +484,7 @@ void VideoDecoder::Reset() {
 }
 
 bool VideoDecoder::Decode(const uint8_t* data, size_t size, uint32_t width, uint32_t height,
-                          std::vector<uint8_t>& bgra, bool& failed) {
+                          std::vector<uint8_t>& nv12, bool& failed) {
     failed = false;
     auto& s = *s_;
     if (!s.mft && !s.Open()) {
@@ -502,7 +502,7 @@ bool VideoDecoder::Decode(const uint8_t* data, size_t size, uint32_t width, uint
     bool got = false;
     HRESULT hr = s.mft->ProcessInput(0, sample.Get(), 0);
     if (hr == MF_E_NOTACCEPTING) {
-        while (s.Output(width, height, bgra) == S_OK) got = true;
+        while (s.Output(width, height, nv12) == S_OK) got = true;
         hr = s.mft->ProcessInput(0, sample.Get(), 0);
     }
     if (FAILED(hr)) {
@@ -510,7 +510,7 @@ bool VideoDecoder::Decode(const uint8_t* data, size_t size, uint32_t width, uint
         return false;
     }
     while (true) {
-        hr = s.Output(width, height, bgra);
+        hr = s.Output(width, height, nv12);
         if (hr == S_OK) {
             got = true;
             continue;

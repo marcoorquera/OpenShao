@@ -192,6 +192,16 @@ void Nv12ToBgra(const uint8_t* y, const uint8_t* uv, uint32_t pitch, uint32_t wi
     }
 }
 
+void PackNv12(const uint8_t* y, const uint8_t* uv, uint32_t pitch, uint32_t width, uint32_t height,
+              std::vector<uint8_t>& nv12) {
+    nv12.resize(size_t(width) * height * 3 / 2);
+    for (uint32_t row = 0; row < height; ++row)
+        std::memcpy(nv12.data() + size_t(row) * width, y + size_t(row) * pitch, width);
+    uint8_t* chroma = nv12.data() + size_t(width) * height;
+    for (uint32_t row = 0; row < height / 2; ++row)
+        std::memcpy(chroma + size_t(row) * width, uv + size_t(row) * pitch, width);
+}
+
 bool ParsePacket(const uint8_t* data, size_t size, Header& header, const uint8_t*& payload) {
     if (size < sizeof(Header)) return false;
     std::memcpy(&header, data, sizeof(Header));
