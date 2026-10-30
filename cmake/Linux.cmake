@@ -13,7 +13,7 @@ set(OPENSHAO_IMGUI_CORE
 set(OPENSHAO_SHARED_SOURCES
     src/host.cpp src/keyboard.cpp src/game_info.cpp src/game_files.cpp src/runtime_paths.cpp
     src/game_setup.cpp src/game_import.cpp src/save_storage.cpp src/performance_overlay.cpp
-    src/voice_language.cpp src/scorpion_voice.cpp src/scorpion_preview_audio.cpp src/scorpion_preview_adx.cpp src/scorpion_preview_mix.cpp src/controller.cpp src/netplay.cpp src/stream.cpp src/stream_protocol.cpp src/launcher.cpp src/launcher_art.cpp src/updater.cpp "${OPENSHAO_LAUNCHER_FONTS}" src/launcher_settings.cpp src/game_preferences.cpp src/brightness.cpp
+    src/voice_language.cpp src/scorpion_voice.cpp src/scorpion_preview_audio.cpp src/scorpion_preview_adx.cpp src/scorpion_preview_mix.cpp src/controller.cpp src/netplay.cpp src/stream.cpp src/stream_protocol.cpp src/stream_upnp.cpp src/stream_video.cpp src/launcher.cpp src/launcher_art.cpp src/updater.cpp "${OPENSHAO_LAUNCHER_FONTS}" src/launcher_settings.cpp src/game_preferences.cpp src/brightness.cpp
     src/menu_text.cpp src/menu_renderer.cpp src/system_text.cpp
     src/recomp_settings_model.cpp src/recomp_settings.cpp src/restart.cpp src/restart_process.cpp src/restart_boot.cpp
     src/mouse_state.cpp src/raster_compat.cpp src/ed_nexus.cpp src/pause_recomp.cpp src/strip_orientation.cpp src/strip_orientation_hooks.cpp src/survival5_recovery_hooks.cpp src/aspect_ratio.cpp src/aspect_hooks.cpp
@@ -57,7 +57,7 @@ set_source_files_properties(src/linux/linux_main.cpp PROPERTIES COMPILE_DEFINITI
 target_compile_options(OpenShao PRIVATE -fno-strict-aliasing -march=x86-64-v2)
 # libstdc++ and libgcc go into the executable: the player's distribution only has to supply glibc
 target_link_options(OpenShao PRIVATE -fuse-ld=lld -static-libstdc++ -static-libgcc)
-target_link_libraries(OpenShao PRIVATE openshao_mods miniz tomlplusplus::tomlplusplus SDL3::SDL3-static Threads::Threads
+target_link_libraries(OpenShao PRIVATE openshao_mods miniz opus tomlplusplus::tomlplusplus SDL3::SDL3-static Threads::Threads
     Vulkan::Headers glslang::glslang glslang::glslang-default-resource-limits ${CMAKE_DL_LIBS})
 
 # Regression tests that do not depend on Windows.
@@ -81,7 +81,7 @@ openshao_linux_test(recomp_language_pack SOURCES tests/recomp_language_pack_test
 openshao_linux_test(recomp_launcher_settings SOURCES tests/recomp_launcher_settings_test.cpp src/launcher_settings.cpp LIBS tomlplusplus::tomlplusplus)
 openshao_linux_test(recomp_mouse SOURCES tests/recomp_mouse_test.cpp src/mouse_state.cpp)
 openshao_linux_test(recomp_netplay SOURCES tests/recomp_netplay_test.cpp src/netplay.cpp LIBS Threads::Threads)
-openshao_linux_test(recomp_stream SOURCES tests/recomp_stream_test.cpp src/stream_protocol.cpp)
+openshao_linux_test(recomp_stream SOURCES tests/recomp_stream_test.cpp src/stream_protocol.cpp LIBS opus)
 openshao_linux_test(recomp_sfd_lock SOURCES tests/recomp_sfd_lock_test.cpp)
 openshao_linux_test(recomp_vblank SOURCES tests/recomp_vblank_test.cpp)
 openshao_linux_test(recomp_input_mode SOURCES tests/recomp_input_mode_test.cpp)

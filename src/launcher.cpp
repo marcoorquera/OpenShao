@@ -2,6 +2,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <windows.h>
 #include <shellapi.h>
 #include <shobjidl.h>
@@ -211,6 +214,51 @@ struct Popup {
     bool close_after = false;
 };
 
+std::vector<std::string> QueryHostAddresses() {
+#ifdef _WIN32
+    std::vector<std::string> addresses;
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG size = 15000;
+    std::vector<uint8_t> buffer(size);
+    auto adapter = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+    ULONG ret = GetAdaptersAddresses(AF_INET, flags, nullptr, adapter, &size);
+    if (ret == ERROR_BUFFER_OVERFLOW) {
+        buffer.resize(size);
+        adapter = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+        ret = GetAdaptersAddresses(AF_INET, flags, nullptr, adapter, &size);
+    }
+    if (ret != NO_ERROR && ret != ERROR_SUCCESS) return addresses;
+
+    for (auto curr = adapter; curr != nullptr && addresses.size() < 3; curr = curr->Next) {
+        if (curr->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        if (curr->OperStatus != IfOperStatusUp) continue;
+
+        for (auto uni = curr->FirstUnicastAddress; uni != nullptr && addresses.size() < 3; uni = uni->Next) {
+            sockaddr* sa = uni->Address.lpSockaddr;
+            if (!sa || sa->sa_family != AF_INET) continue;
+            auto sin = reinterpret_cast<sockaddr_in*>(sa);
+            const auto* b = reinterpret_cast<const uint8_t*>(&sin->sin_addr.s_addr);
+            if (b[0] == 127 || b[0] == 0) continue;
+
+            char ip_str[32];
+            std::snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+
+            std::string entry = ip_str;
+            // Tailscale assigns addresses in the 100.64.0.0/10 Carrier-Grade NAT block.
+            if (b[0] == 100 && (b[1] & 0xC0) == 0x40) {
+                entry += " (Tailscale)";
+            }
+            if (std::find(addresses.begin(), addresses.end(), entry) == addresses.end()) {
+                addresses.push_back(std::move(entry));
+            }
+        }
+    }
+    return addresses;
+#else
+    return {};
+#endif
+}
+
 struct Session {
     Page page = Page::Play;
     Settings settings;
@@ -226,9 +274,13 @@ struct Session {
     std::unique_ptr<GamePreparation> preparing;
     std::string game_error;
     float reveal = 0.f;  // the ensō draws itself once when the launcher opens
-    int netplay_mode = options.netplay_host ? 1 : options.netplay_join ? 2 : 0; // 0=Offline, 1=Host LAN, 2=Join LAN
+    int netplay_mode = options.stream_host ? 1 : options.stream_join ? 2 : 0; // 0=Offline, 1=Host, 2=Join
     char netplay_endpoint[128] = "127.0.0.1:27886";
-    int netplay_delay = int(options.netplay_delay ? options.netplay_delay : netplay::kDefaultDelay);
+    std::vector<std::string> host_addresses = (netplay_mode == 1) ? QueryHostAddresses() : std::vector<std::string>{};
+
+    void GatherHostAddresses() {
+        host_addresses = QueryHostAddresses();
+    }
 
     void Message(std::string title, std::string text, bool close_after = false) {
         popup = Popup{std::move(title), std::move(text), {}, {}, close_after};
@@ -255,32 +307,39 @@ struct Session {
 
     void Play() {
         if (options.configure_only) { Close(); return; }
-        if (source.empty()) { ChangeGame(); return; }
-        if (Busy()) {
+        const bool join = netplay_mode == 2;
+        if (!join && source.empty()) { ChangeGame(); return; }
+        if (!join && Busy()) {
             page = Page::Mods;
             Message("Mod operation in progress", "Wait for the mod operation to finish, or cancel it in Mods.");
             return;
         }
-        if (const auto missing = MissingLanguagePack(settings); !missing.empty()) {
-            page = Page::Mods;
-            Message("Language pack required", missing);
-            return;
+        if (!join) {
+            if (const auto missing = MissingLanguagePack(settings); !missing.empty()) {
+                page = Page::Mods;
+                Message("Language pack required", missing);
+                return;
+            }
         }
         std::string error;
         if (!Validate(settings, error)) { Message("Check your settings", error); return; }
         if (netplay_mode == 1) {
-            options.netplay_host = true;
+            options.stream_host = true;
+            options.stream_join = false;
+            options.netplay_host = false;
             options.netplay_join = false;
-            options.netplay_delay = unsigned(std::clamp(netplay_delay, 1, int(netplay::kMaxDelay)));
         } else if (netplay_mode == 2) {
-            if (!netplay::ParseEndpoint(netplay_endpoint, options.netplay_address, options.netplay_port)) {
+            if (!netplay::ParseEndpoint(netplay_endpoint, options.stream_address, options.stream_port)) {
                 Message("Check LAN address", "Enter a valid host IPv4 address and optional port (for example 192.168.1.50:27886).");
                 return;
             }
-            options.netplay_join = true;
+            options.stream_join = true;
+            options.stream_host = false;
             options.netplay_host = false;
-            options.netplay_delay = unsigned(std::clamp(netplay_delay, 1, int(netplay::kMaxDelay)));
+            options.netplay_join = false;
         } else {
+            options.stream_host = false;
+            options.stream_join = false;
             options.netplay_host = false;
             options.netplay_join = false;
         }
@@ -485,24 +544,24 @@ void PlayPage(Session& s, const Canvas& c, float W, float H) {
 
     if (!updating && !options.configure_only) {
         const float bar_y = footer - 46;
-        const char* modes[] = {"Offline", "Host LAN", "Join LAN"};
+        const char* modes[] = {"Offline", "Host", "Join"};
         const float pill_w = 104.f, pill_h = 30.f, gap = 10.f;
         const float total_w = 3 * pill_w + 2 * gap;
         float mx = center.x - total_w / 2;
         for (int i = 0; i < 3; ++i) {
             const bool active = s.netplay_mode == i;
             if (Button(modes[i], c, mx, bar_y, mx + pill_w, bar_y + pill_h, modes[i], active)) {
+                if (s.netplay_mode != i && i == 1) s.GatherHostAddresses();
                 s.netplay_mode = i;
             }
             mx += pill_w + gap;
         }
         if (s.netplay_mode == 1) {
-            char info[64];
-            std::snprintf(info, sizeof(info), "UDP port %u  |  Delay %df", unsigned(options.netplay_port), s.netplay_delay);
-            c.Text(Weight::Regular, 17.5f, mx + 8, bar_y + 5, Rgb(color::Mist), info);
-            const float info_w = c.Measure(Weight::Regular, 17.5f, info).x;
-            if (Link("-##delay_dec", c, mx + 16 + info_w, bar_y + 5, "[-]", false, s.netplay_delay > 1)) --s.netplay_delay;
-            if (Link("+##delay_inc", c, mx + 50 + info_w, bar_y + 5, "[+]", false, s.netplay_delay < int(netplay::kMaxDelay))) ++s.netplay_delay;
+            std::string info = "UDP port " + std::to_string(options.stream_port);
+            for (size_t i = 0; i < s.host_addresses.size() && i < 3; ++i) {
+                info += (i == 0 ? "  |  " : "  ") + s.host_addresses[i];
+            }
+            c.Text(Weight::Regular, 17.5f, mx + 8, bar_y + 5, Rgb(color::Mist), info.c_str());
         } else if (s.netplay_mode == 2) {
             ImGui::SetCursorScreenPos(c.P(mx + 8, bar_y + 2));
             ImGui::PushItemWidth(c.S(190.f));
@@ -940,6 +999,10 @@ public:
                 << ",\"enabled\":" << (installed && installed->enabled ? "true" : "false") << "}";
             first = false;
         }
+        out << "],\"netplay_mode\":" << s.netplay_mode << ",\"host_addresses\":[";
+        for (size_t i = 0; i < s.host_addresses.size(); ++i) {
+            out << (i == 0 ? "\"" : ",\"") << Escape(s.host_addresses[i]) << "\"";
+        }
         out << "],\"check_updates\":" << (s.check_updates ? "true" : "false") << ",\"game_busy\":" << (s.preparing ? "true" : "false")
             << ",\"game_error\":\"" << Escape(s.game_error) << "\"}";
         const auto text = out.str();
@@ -983,6 +1046,14 @@ private:
         else if (command == "mod-toggle") s.ToggleMod(argument);
         else if (command == "mod-remove") {
             for (const auto& mod : mods::DisplayMods(s.mods->View())) if (mod.id == argument) s.RemoveMod(mod);
+        }
+        else if (command == "mode") {
+            if (argument == "offline") s.netplay_mode = 0;
+            else if (argument == "host") { if (s.netplay_mode != 1) s.GatherHostAddresses(); s.netplay_mode = 1; }
+            else if (argument == "join") s.netplay_mode = 2;
+        }
+        else if (command == "netplay-endpoint") {
+            std::snprintf(s.netplay_endpoint, sizeof(s.netplay_endpoint), "%s", argument.c_str());
         }
         else LOGE("launcher test: unknown command %s", line.c_str());
     }

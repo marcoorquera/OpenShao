@@ -44,23 +44,31 @@ This fork builds on the upstream [OpenShao](https://github.com/OAleex/OpenShao) 
 2. Right-click the `.zip` archive and extract it to a folder on your PC (for example, `C:\Games\OpenShao`).
 3. Run `OpenShao.exe` once to open the launcher.
 4. Select your USA/Europe Xbox game copy (an ISO, XISO, ZIP, extracted folder or `default.xbe`).
-5. Click **Play** to start single-player or local Ko-op, or close the launcher to start a 2-PC LAN Netplay session below.
+5. Click **Play** to start single-player or local Ko-op, or select **Host** to invite a second player over LAN streaming.
 
 Keep the game image or folder where it is. OpenShao reads it in place.
 
 ### 2-PC LAN / Peer-to-Peer Netplay Quick Start (Windows)
 
-1. Install the same Windows release `.zip` and configure the game in the launcher on **both PCs**.
-2. On **PC 1 (Host / Player 1)**, open PowerShell in the extracted `OpenShao` folder, check your local IP with `ipconfig`, and run:
-   ```powershell
-   .\OpenShao.exe --no-launcher --netplay-host 27886
-   ```
-   *(If Windows Defender Firewall prompts for access, allow UDP port `27886` on Private and Public networks.)*
-3. On **PC 2 (Client / Player 2)**, open PowerShell in the extracted `OpenShao` folder and connect using PC 1's IP address:
-   ```powershell
-   .\OpenShao.exe --no-launcher --netplay-join 192.168.1.50:27886
-   ```
-4. Both PCs will automatically handshake, synchronize clocks and inputs, and enter **Ko-op** or **Versus** together.
+1. Extract the Windows release package on both PCs.
+2. On the host PC, open `OpenShao.exe` and configure your game copy.
+3. Select **Host** in the launcher.
+4. Select **Host** to start the game.
+   *(If Windows Defender Firewall prompts for access, allow UDP port `27886`.)*
+5. On the Player 2 PC, open `OpenShao.exe`. Player 2 does not need a game copy.
+6. Select **Join** in the launcher.
+7. Enter the host IPv4 address shown on the host launcher's info line.
+8. Select **Join** to connect to the host.
+9. Wait for Player 2 to connect before choosing **Ko-op** in the main menu.
+
+Alternatively, start from PowerShell:
+```powershell
+# Host PC (Player 1)
+.\OpenShao.exe --no-launcher --stream-host 27886
+
+# Player 2 PC
+.\OpenShao.exe --no-launcher --stream-join <host-ip>:27886
+```
 
 ### Linux (including SteamOS / Steam Deck)
 
@@ -142,16 +150,14 @@ For a controller without a mapping, put an SDL `gamecontrollerdb.txt` in the dat
 
 ### How does LAN Ko-op (Netplay) work?
 
-Netplay synchronizes both players' inputs on each frame over UDP port `27886`.
+Lockstep netplay synchronizes both players' inputs on each frame over UDP port `27886`.
+Start lockstep netplay from the command line:
 
-1. On the host system (Player 1), open the launcher and select **Host LAN**.
-2. Adjust the frame delay if needed (`1f` to `2f` for local networks).
-3. Select **Play** to start waiting for the peer connection.
-4. On the client system (Player 2), open the launcher and select **Join LAN**.
-5. Enter the host IP address and port, then select **Play**.
-6. Once both systems connect, enter **Ko-op** or **Versus** from the main menu.
+1. On PC 1 (Player 1), run `.\OpenShao.exe --no-launcher --netplay-host 27886`.
+2. On PC 2 (Player 2), run `.\OpenShao.exe --no-launcher --netplay-join <host-ip>:27886`.
+3. Enter **Ko-op** or **Versus** from the main menu.
 
-To test with two windows on the same computer, connect the client to `127.0.0.1:27886`. The second instance automatically uses an isolated `netplay-peer` data folder when the primary data folder is in use.
+Both systems require the same game copy and configuration. To test with two windows on the same computer, connect the client to `127.0.0.1:27886`. The second instance automatically uses an isolated `netplay-peer` data folder when the primary data folder is in use.
 
 Lockstep netplay can desynchronize during gameplay. LAN streaming avoids this.
 
@@ -159,9 +165,12 @@ Lockstep netplay can desynchronize during gameplay. LAN streaming avoids this.
 
 The host runs the only copy of the game in local Ko-op. It sends video and audio to Player 2 over UDP port `27886`. Player 2 sends a gamepad or keyboard state back. Player 2 does not need the game. LAN streaming is available on Windows.
 
-1. On the host system, run `.\OpenShao.exe --no-launcher --stream-host 27886`.
-2. On the Player 2 system, run `.\OpenShao.exe --no-launcher --stream-join <host IP>:27886`.
-3. Wait for Player 2 to connect before you select **Ko-op**.
+1. On the host PC, select **Host** in the launcher and start the game.
+2. On the Player 2 PC, select **Join** in the launcher.
+3. Enter the host IPv4 address and select **Join**.
+4. Wait for Player 2 to connect before you select **Ko-op**.
+
+Alternatively, run `.\OpenShao.exe --no-launcher --stream-host 27886` on the host and `.\OpenShao.exe --no-launcher --stream-join <host-ip>:27886` on Player 2.
 
 Player 2 joins the host as one more gamepad. It becomes Player 2 behind the host's first gamepad. Player 2 can use the default OpenShao keyboard keys in the viewer window. Press F11 or Alt+Enter in the viewer window to switch to full screen.
 

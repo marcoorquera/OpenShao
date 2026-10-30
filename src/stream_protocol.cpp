@@ -1,8 +1,185 @@
 #include "stream.h"
 
+#include <opus.h>
+
 #include <cstring>
 
 namespace openshao::stream {
+
+AudioEncoder::~AudioEncoder() {
+    Reset();
+}
+
+void AudioEncoder::Reset() {
+    if (encoder_) {
+        opus_encoder_destroy(encoder_);
+        encoder_ = nullptr;
+    }
+    rate_ = 0;
+    buffered_ = 0;
+}
+
+bool AudioEncoder::Prepare(uint32_t rate) {
+    if (rate != rate_) {
+        if (encoder_) {
+            opus_encoder_destroy(encoder_);
+            encoder_ = nullptr;
+        }
+        buffered_ = 0;
+        rate_ = rate;
+    }
+    if (rate != kAudioRate) return false;
+    if (!encoder_) {
+        int err = OPUS_OK;
+        encoder_ = opus_encoder_create(opus_int32(kAudioRate), 2, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
+        if (!encoder_ || err != OPUS_OK) {
+            if (encoder_) opus_encoder_destroy(encoder_);
+            encoder_ = nullptr;
+            return false;
+        }
+        opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(opus_int32(kAudioBitrate)));
+        opus_encoder_ctl(encoder_, OPUS_SET_COMPLEXITY(5));
+        opus_encoder_ctl(encoder_, OPUS_SET_INBAND_FEC(1));
+        opus_encoder_ctl(encoder_, OPUS_SET_PACKET_LOSS_PERC(5));
+    }
+    return true;
+}
+
+size_t AudioEncoder::EncodeFrame(AudioChunk& chunk, uint8_t* out, size_t max_size) {
+    if (!encoder_) return 0;
+    const int bytes = opus_encode_float(encoder_, pcm_.data(), int(kAudioPacketFrames), out, opus_int32(max_size));
+    if (bytes <= 0) return 0;
+    chunk.rate = rate_;
+    chunk.frames = uint16_t(kAudioPacketFrames);
+    chunk.codec = kAudioCodecOpus;
+    chunk.index = index_++;
+    return size_t(bytes);
+}
+
+AudioDecoder::~AudioDecoder() {
+    Reset();
+}
+
+void AudioDecoder::Reset() {
+    if (decoder_) {
+        opus_decoder_destroy(decoder_);
+        decoder_ = nullptr;
+    }
+    expected_index_ = 0;
+    has_index_ = false;
+}
+
+bool AudioDecoder::Prepare(const AudioChunk& chunk, const uint8_t* data, size_t size, uint32_t& gap) {
+    if (chunk.codec != kAudioCodecOpus || chunk.rate != kAudioRate || chunk.frames != kAudioPacketFrames || !data || !size)
+        return false;
+    if (!decoder_) {
+        int err = OPUS_OK;
+        decoder_ = opus_decoder_create(opus_int32(kAudioRate), 2, &err);
+        if (!decoder_ || err != OPUS_OK) {
+            if (decoder_) opus_decoder_destroy(decoder_);
+            decoder_ = nullptr;
+            return false;
+        }
+    }
+    if (!has_index_) {
+        gap = 0;
+    } else {
+        const int32_t diff = int32_t(chunk.index - expected_index_);
+        // A late duplicate is dropped; a large step back means the host restarted its counter.
+        if (diff < 0 && diff > -int32_t(kAudioResyncPackets)) return false;
+        gap = diff < 0 ? 0 : uint32_t(diff);
+    }
+    return true;
+}
+
+bool AudioDecoder::DecodeFrame(const uint8_t* data, size_t size, bool fec, int16_t* out) {
+    if (!decoder_ || !out) return false;
+    const int frames = opus_decode(decoder_, data, opus_int32(size), out, int(kAudioPacketFrames), fec ? 1 : 0);
+    return frames == int(kAudioPacketFrames);
+}
+
+void AudioDecoder::AdvanceIndex(uint32_t index) {
+    has_index_ = true;
+    expected_index_ = index + 1;
+}
+
+bool AudioDecoder::Decode(const AudioChunk& chunk, const uint8_t* data, size_t size, std::vector<int16_t>& out) {
+    std::array<int16_t, kAudioPacketFrames * 2> frame{};
+    return Decode(
+        chunk, data, size,
+        [&]() { return frame.data(); },
+        [&](const int16_t* pcm) { out.insert(out.end(), pcm, pcm + frame.size()); });
+}
+
+uint32_t VideoScale(uint32_t width, uint32_t height) {
+    uint32_t scale = 1;
+    while (width / scale > kVideoMaxWidth || height / scale > kVideoMaxHeight) ++scale;
+    return scale;
+}
+
+namespace {
+
+uint8_t Clamp8(int v) { return uint8_t(v < 0 ? 0 : v > 255 ? 255 : v); }
+
+} // namespace
+
+void BgraToNv12(const uint8_t* bgra, uint32_t pitch, uint32_t width, uint32_t height, uint32_t scale,
+                std::vector<uint8_t>& nv12, uint32_t& out_width, uint32_t& out_height) {
+    if (!scale) scale = 1;
+    out_width = (width / scale) & ~1u;
+    out_height = (height / scale) & ~1u;
+    nv12.resize(size_t(out_width) * out_height * 3 / 2);
+    if (!out_width || !out_height) return;
+    uint8_t* y_plane = nv12.data();
+    uint8_t* uv_plane = y_plane + size_t(out_width) * out_height;
+    const uint32_t area = scale * scale;
+    for (uint32_t oy = 0; oy < out_height; oy += 2) {
+        for (uint32_t ox = 0; ox < out_width; ox += 2) {
+            int sum_r = 0, sum_g = 0, sum_b = 0;
+            for (uint32_t dy = 0; dy < 2; ++dy) {
+                for (uint32_t dx = 0; dx < 2; ++dx) {
+                    uint32_t r = 0, g = 0, b = 0;
+                    for (uint32_t sy = 0; sy < scale; ++sy) {
+                        const uint8_t* row = bgra + size_t((oy + dy) * scale + sy) * pitch + size_t((ox + dx) * scale) * 4;
+                        for (uint32_t sx = 0; sx < scale; ++sx) {
+                            b += row[sx * 4];
+                            g += row[sx * 4 + 1];
+                            r += row[sx * 4 + 2];
+                        }
+                    }
+                    const int ri = int(r / area), gi = int(g / area), bi = int(b / area);
+                    y_plane[size_t(oy + dy) * out_width + ox + dx] = Clamp8(16 + ((47 * ri + 157 * gi + 16 * bi + 128) >> 8));
+                    sum_r += ri;
+                    sum_g += gi;
+                    sum_b += bi;
+                }
+            }
+            const int r = sum_r / 4, g = sum_g / 4, b = sum_b / 4;
+            uint8_t* uv = uv_plane + size_t(oy / 2) * out_width + ox;
+            uv[0] = Clamp8(128 + ((-26 * r - 87 * g + 112 * b + 128) >> 8));
+            uv[1] = Clamp8(128 + ((112 * r - 102 * g - 10 * b + 128) >> 8));
+        }
+    }
+}
+
+void Nv12ToBgra(const uint8_t* y, const uint8_t* uv, uint32_t pitch, uint32_t width, uint32_t height,
+                std::vector<uint8_t>& bgra) {
+    bgra.resize(size_t(width) * height * 4);
+    for (uint32_t row = 0; row < height; ++row) {
+        const uint8_t* yr = y + size_t(row) * pitch;
+        const uint8_t* uvr = uv + size_t(row / 2) * pitch;
+        uint8_t* out = bgra.data() + size_t(row) * width * 4;
+        for (uint32_t col = 0; col < width; ++col) {
+            const int c = 298 * (int(yr[col]) - 16);
+            const int u = int(uvr[col & ~1u]) - 128;
+            const int v = int(uvr[(col & ~1u) + 1]) - 128;
+            out[col * 4] = Clamp8((c + 541 * u + 128) >> 8);
+            out[col * 4 + 1] = Clamp8((c - 55 * u - 136 * v + 128) >> 8);
+            out[col * 4 + 2] = Clamp8((c + 459 * v + 128) >> 8);
+            out[col * 4 + 3] = 255;
+        }
+    }
+}
 
 bool ParsePacket(const uint8_t* data, size_t size, Header& header, const uint8_t*& payload) {
     if (size < sizeof(Header)) return false;
