@@ -29,7 +29,7 @@ To turn off the check, open Files and clear Updates.
 To update manually, download the package for your system and extract it to a new folder:
 Windows: OpenShao-<version>-Windows-x64.zip
 Linux:   OpenShao-<version>-Linux-x64.tar.gz
-https://github.com/OAleex/OpenShao/releases/latest
+https://github.com/marcoorquera/OpenShao/releases/latest
 
 
 SETTINGS AND CONTROLS

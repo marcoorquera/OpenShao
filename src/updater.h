@@ -11,8 +11,8 @@
 #include <vector>
 
 namespace openshao::update {
-inline constexpr const char* kLatestReleaseUrl = "https://api.github.com/repos/OAleex/OpenShao/releases/latest";
-inline constexpr const char* kReleasesPage = "https://github.com/OAleex/OpenShao/releases/latest";
+inline constexpr const char* kLatestReleaseUrl = "https://api.github.com/repos/marcoorquera/OpenShao/releases/latest";
+inline constexpr const char* kReleasesPage = "https://github.com/marcoorquera/OpenShao/releases/latest";
 
 struct Release {
     std::string version, page, package_name, package_url, checksums_url, sha256;

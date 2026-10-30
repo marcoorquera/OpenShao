@@ -14,11 +14,11 @@ std::string Get(const fs::path& p) { std::ifstream f(p, std::ios::binary); retur
 void Put(const fs::path& p, const std::string& text) { fs::create_directories(p.parent_path()); std::ofstream(p, std::ios::binary) << text; }
 std::string Release(const std::string& tag, const std::string& digest, bool checksums, uint64_t size = 4) {
     const auto name = update::PackageName(tag.starts_with('v') ? tag.substr(1) : tag);
-    std::string assets = "{\"name\":\"" + name + "\",\"size\":" + std::to_string(size) + ",\"browser_download_url\":\"https://github.com/OAleex/OpenShao/releases/download/" + tag + "/" + name + "\"" +
+    std::string assets = "{\"name\":\"" + name + "\",\"size\":" + std::to_string(size) + ",\"browser_download_url\":\"https://github.com/marcoorquera/OpenShao/releases/download/" + tag + "/" + name + "\"" +
                          (digest.empty() ? "" : ",\"digest\":\"" + digest + "\"") + "}";
-    assets += ",{\"name\":\"OpenShao-9.9.9-Other-arm64.zip\",\"size\":1,\"browser_download_url\":\"https://github.com/OAleex/OpenShao/releases/download/x/other\"}";
-    if (checksums) assets += ",{\"name\":\"checksums.txt\",\"size\":10,\"browser_download_url\":\"https://github.com/OAleex/OpenShao/releases/download/" + tag + "/checksums.txt\"}";
-    return "{\"tag_name\":\"" + tag + "\",\"html_url\":\"https://github.com/OAleex/OpenShao/releases/tag/" + tag +
+    assets += ",{\"name\":\"OpenShao-9.9.9-Other-arm64.zip\",\"size\":1,\"browser_download_url\":\"https://github.com/marcoorquera/OpenShao/releases/download/x/other\"}";
+    if (checksums) assets += ",{\"name\":\"checksums.txt\",\"size\":10,\"browser_download_url\":\"https://github.com/marcoorquera/OpenShao/releases/download/" + tag + "/checksums.txt\"}";
+    return "{\"tag_name\":\"" + tag + "\",\"html_url\":\"https://github.com/marcoorquera/OpenShao/releases/tag/" + tag +
            "\",\"draft\":false,\"prerelease\":false,\"body\":\"Fixes \\u00e7 \\ud83d\\ude00\",\"assets\":[" + assets + "]}";
 }
 int main(int argc, char** argv) {
