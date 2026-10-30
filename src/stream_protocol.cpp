@@ -335,6 +335,21 @@ bool FrameAssembler::Add(const VideoChunk& chunk, const uint8_t* data, size_t si
     return true;
 }
 
+uint32_t PingFilter::Add(uint32_t rtt_ms) {
+    if (!started_) {
+        started_ = true;
+        value_ = rtt_ms;
+    } else {
+        // Exponential average with weight 1/4. Each step moves at least 1 ms so integer rounding
+        // cannot leave the value stuck next to a steady ping.
+        const int64_t delta = int64_t(rtt_ms) - int64_t(value_);
+        int64_t step = delta / 4;
+        if (step == 0 && delta != 0) step = delta > 0 ? 1 : -1;
+        value_ = uint32_t(int64_t(value_) + step);
+    }
+    return value_;
+}
+
 void SequenceCounter::Add(uint32_t seq, StreamStats& stats) {
     ++stats.packets_received;
     const int32_t ahead = int32_t(seq - highest_);
