@@ -46,6 +46,7 @@
 #include "netplay.h"
 #include "performance_overlay.h"
 #include "runtime_paths.h"
+#include "stream.h"
 #include "updater.h"
 
 namespace fs = std::filesystem;
@@ -274,8 +275,13 @@ struct Session {
     std::unique_ptr<GamePreparation> preparing;
     std::string game_error;
     float reveal = 0.f;  // the ensō draws itself once when the launcher opens
-    int netplay_mode = options.stream_host ? 1 : options.stream_join ? 2 : 0; // 0=Offline, 1=Host, 2=Join
+    int netplay_mode = options.stream_host ? 1 : options.stream_join ? 2 : 0; // 0=Offline, 1=Host, 2=Join, 3=Online
     char netplay_endpoint[128] = "127.0.0.1:27886";
+    // Online: the code exchange panel and the role chosen in it.
+    bool online_open = false;
+    bool online_host = true;
+    char online_input[2048] = {};
+    std::string online_error;
     std::vector<std::string> host_addresses = (netplay_mode == 1) ? QueryHostAddresses() : std::vector<std::string>{};
 
     void GatherHostAddresses() {
@@ -306,8 +312,13 @@ struct Session {
     bool Busy() const { const auto view = mods->View(); return view.busy && !view.checking; }
 
     void Play() {
+        if (netplay_mode == 3 && !options.configure_only) { OpenOnline(); return; }
+        Launch(netplay_mode, false);
+    }
+    // mode: 0 offline, 1 host, 2 join. Online play reuses host and join with the prepared connection.
+    void Launch(int mode, bool online) {
         if (options.configure_only) { Close(); return; }
-        const bool join = netplay_mode == 2;
+        const bool join = mode == 2;
         if (!join && source.empty()) { ChangeGame(); return; }
         if (!join && Busy()) {
             page = Page::Mods;
@@ -323,13 +334,15 @@ struct Session {
         }
         std::string error;
         if (!Validate(settings, error)) { Message("Check your settings", error); return; }
-        if (netplay_mode == 1) {
+        if (mode == 1) {
             options.stream_host = true;
             options.stream_join = false;
             options.netplay_host = false;
             options.netplay_join = false;
-        } else if (netplay_mode == 2) {
-            if (!netplay::ParseEndpoint(netplay_endpoint, options.stream_address, options.stream_port)) {
+        } else if (mode == 2) {
+            if (online) {
+                options.stream_address.clear();
+            } else if (!netplay::ParseEndpoint(netplay_endpoint, options.stream_address, options.stream_port)) {
                 Message("Check LAN address", "Enter a valid host IPv4 address and optional port (for example 192.168.1.50:27886).");
                 return;
             }
@@ -343,14 +356,49 @@ struct Session {
             options.netplay_host = false;
             options.netplay_join = false;
         }
+        // A prepared internet connection would otherwise replace the LAN socket.
+        if (!online) stream::CancelOnline();
         if (updater) updater->Cancel();
         Apply(settings, true);
         if (!source.empty()) { options.disc = source; options.game.clear(); }
+        online_open = false;
         result = 1;
     }
     void Close() {
         if (updater) updater->Cancel();
+        stream::CancelOnline();
         result = 0;
+    }
+
+    void OpenOnline() {
+        online_open = true;
+        if (online_host && stream::Online().step == stream::OnlineStep::Idle) stream::CreateInvite();
+    }
+    void SetOnlineRole(bool host) {
+        if (online_host == host) return;
+        online_host = host;
+        online_error.clear();
+        online_input[0] = '\0';
+        stream::CancelOnline();
+        if (host) stream::CreateInvite();
+    }
+    void NewInvite() {
+        online_error.clear();
+        online_input[0] = '\0';
+        stream::CreateInvite();
+    }
+    // The host accepts the reply code; Player 2 accepts the invite code and gets a reply code.
+    void SubmitOnlineCode() {
+        std::string error;
+        const bool ok = online_host ? stream::AcceptReply(online_input, error) : stream::JoinInvite(online_input, error);
+        online_error = ok ? std::string{} : error;
+    }
+    void StartOnline() {
+        const auto status = stream::Online();
+        const bool ready = status.host == online_host &&
+                           (status.step == stream::OnlineStep::Connecting || status.step == stream::OnlineStep::Connected);
+        if (!ready) return;
+        Launch(online_host ? 1 : 2, true);
     }
 
     // Opens the selection page, or checks the given path directly and remembers it.
@@ -453,6 +501,7 @@ struct Session {
         if (reveal < 1.f) return true;
         if (mods && mods->View().busy) return true;
         if (preparing) return true;
+        if (online_open) return true;  // the connection state changes on other threads
         if (updater) { const auto state = updater->Get().state; return state == update::State::Checking || state == update::State::Downloading; }
         return false;
     }
@@ -529,7 +578,7 @@ void PlayPage(Session& s, const Canvas& c, float W, float H) {
         art::Glow(c, center, R, hit.hovered ? 1.45f : 1.f);
         const float eased = 1.f - std::pow(1.f - std::clamp(s.reveal, 0.f, 1.f), 3.f);
         art::Enso(c, center, R, stroke, eased, 1.f);
-        const char* label = options.configure_only ? "Close" : (s.netplay_mode == 1 ? "Host" : s.netplay_mode == 2 ? "Join" : "Play");
+        const char* label = options.configure_only ? "Close" : (s.netplay_mode == 1 ? "Host" : s.netplay_mode == 2 ? "Join" : s.netplay_mode == 3 ? "Online" : "Play");
         const float label_h = c.Measure(Weight::Medium, 54, label).y;
         c.TextCentered(Weight::Medium, 54, center.x + 4, center.y - label_h / 2 - 2, Rgb(color::Paper, hit.hovered ? 1.f : 0.94f), label);
     } else {
@@ -544,15 +593,16 @@ void PlayPage(Session& s, const Canvas& c, float W, float H) {
 
     if (!updating && !options.configure_only) {
         const float bar_y = footer - 46;
-        const char* modes[] = {"Offline", "Host", "Join"};
+        const char* modes[] = {"Offline", "Host", "Join", "Online"};
         const float pill_w = 104.f, pill_h = 30.f, gap = 10.f;
-        const float total_w = 3 * pill_w + 2 * gap;
+        const float total_w = 4 * pill_w + 3 * gap;
         float mx = center.x - total_w / 2;
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 4; ++i) {
             const bool active = s.netplay_mode == i;
             if (Button(modes[i], c, mx, bar_y, mx + pill_w, bar_y + pill_h, modes[i], active)) {
                 if (s.netplay_mode != i && i == 1) s.GatherHostAddresses();
                 s.netplay_mode = i;
+                if (i == 3) s.OpenOnline();
             }
             mx += pill_w + gap;
         }
@@ -561,7 +611,7 @@ void PlayPage(Session& s, const Canvas& c, float W, float H) {
             for (size_t i = 0; i < s.host_addresses.size() && i < 3; ++i) {
                 info += (i == 0 ? "  |  " : "  ") + s.host_addresses[i];
             }
-            c.Text(Weight::Regular, 17.5f, mx + 8, bar_y + 5, Rgb(color::Mist), info.c_str());
+            c.Text(Weight::Regular, 17.5f, mx + 8, bar_y + 5, Rgb(color::Mist), c.Fit(Weight::Regular, 17.5f, W - 40 - mx - 8, info).c_str());
         } else if (s.netplay_mode == 2) {
             ImGui::SetCursorScreenPos(c.P(mx + 8, bar_y + 2));
             ImGui::PushItemWidth(c.S(190.f));
@@ -814,6 +864,98 @@ void PopupOverlay(Session& s, const Canvas& c, float W, float H) {
     }
 }
 
+// Internet play: the host and Player 2 exchange an invite code and a reply code through any chat app.
+void OnlinePanel(Session& s, const Canvas& c, float W, float H) {
+    using stream::OnlineStep;
+    const auto status = stream::Online();
+    const bool mine = status.host == s.online_host;
+    const OnlineStep step = mine ? status.step : OnlineStep::Idle;
+    c.Rect(0, 0, W, H, Rgb(0x15171A, 0.62f));
+    const float width = 560, height = 432;
+    const float x0 = (W - width) / 2, y0 = (H - height) / 2;
+    const float x = x0 + 28, right = x0 + width - 28;
+    c.Rect(x0, y0, x0 + width, y0 + height, Rgb(color::Slate), 14);
+    c.Outline(x0, y0, x0 + width, y0 + height, Rgb(color::Line), 14);
+    float y = y0 + 28;
+    c.Text(Weight::SemiBold, 22, x, y, Rgb(color::Paper), "Play online");
+
+    y += 46;
+    const float half = (right - x - 12) / 2;
+    if (Button("##online-invite", c, x, y, x + half, y + 34, "Invite a friend", s.online_host)) s.SetOnlineRole(true);
+    if (Button("##online-join", c, x + half + 12, y, right, y + 34, "Join a friend", !s.online_host)) s.SetOnlineRole(false);
+    y += 58;
+
+    // The code this side sends, with its copy button.
+    auto code_row = [&](const char* id, const char* empty) {
+        const float copy_w = 84;
+        c.Rect(x, y, right - copy_w - 10, y + 36, Rgb(0x15171A, 0.55f), 8);
+        const std::string shown = status.code.empty() || !mine ? empty : status.code;
+        c.Text(Weight::Regular, 17, x + 12, y + 8, Rgb(status.code.empty() || !mine ? color::Dim : color::Paper),
+               c.Fit(Weight::Regular, 17, right - copy_w - 10 - x - 24, shown).c_str());
+        if (Button(id, c, right - copy_w, y, right, y + 36, "Copy", false, mine && !status.code.empty()))
+            ImGui::SetClipboardText(status.code.c_str());
+        y += 54;
+    };
+    // The code this side receives. Enter or Paste submits it.
+    auto input_row = [&](const char* id, bool enabled) {
+        const float paste_w = 84;
+        ImGui::BeginDisabled(!enabled);
+        ImGui::SetCursorScreenPos(c.P(x, y + 4));
+        ImGui::PushItemWidth(c.S(right - paste_w - 10 - x));
+        const bool entered = ImGui::InputText(id, s.online_input, sizeof(s.online_input), ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::PopItemWidth();
+        ImGui::EndDisabled();
+        bool submit = entered && enabled && s.online_input[0];
+        if (Button((std::string(id) + "-paste").c_str(), c, right - paste_w, y, right, y + 36, "Paste", false, enabled)) {
+            if (const char* clip = ImGui::GetClipboardText()) std::snprintf(s.online_input, sizeof(s.online_input), "%s", clip);
+            submit = s.online_input[0] != '\0';
+        }
+        if (submit) s.SubmitOnlineCode();
+        y += 54;
+    };
+
+    if (s.online_host) {
+        c.Text(Weight::Medium, 19, x, y, Rgb(color::Paper), "1. Send this invite code to your friend.");
+        y += 32;
+        code_row("##online-copy", step == OnlineStep::Failed ? "No invite" : "Preparing your invite...");
+        c.Text(Weight::Medium, 19, x, y, Rgb(color::Paper), "2. Paste the reply code from your friend.");
+        y += 32;
+        input_row("##online-reply", step == OnlineStep::Waiting);
+    } else {
+        c.Text(Weight::Medium, 19, x, y, Rgb(color::Paper), "1. Paste the invite code from the host.");
+        y += 32;
+        input_row("##online-invite-code", step == OnlineStep::Idle || step == OnlineStep::Failed);
+        c.Text(Weight::Medium, 19, x, y, Rgb(color::Paper), "2. Send this reply code to the host.");
+        y += 32;
+        code_row("##online-copy", step == OnlineStep::Preparing ? "Preparing your reply..." : "Your reply appears here");
+    }
+
+    const char* state = "";
+    switch (step) {
+        case OnlineStep::Idle: state = s.online_host ? "" : "Waiting for the invite code."; break;
+        case OnlineStep::Preparing: state = "Finding your network addresses..."; break;
+        case OnlineStep::Waiting: state = "Waiting for the reply code."; break;
+        case OnlineStep::Connecting:
+            state = s.online_host ? "Start the game. Your friend connects while it runs."
+                                  : "Send the reply code, then start. The game appears once the host accepts it.";
+            break;
+        case OnlineStep::Connected: state = "Connected to your friend."; break;
+        case OnlineStep::Failed: state = ""; break;
+    }
+    const std::string problem = !s.online_error.empty() ? s.online_error : step == OnlineStep::Failed ? status.error : std::string{};
+    c.Text(Weight::Regular, 18, x, y, Rgb(problem.empty() ? color::Mist : color::Warning),
+           problem.empty() ? state : problem.c_str(), right - x);
+
+    const float by = y0 + height - 24 - 36;
+    const bool ready = step == OnlineStep::Connecting || step == OnlineStep::Connected;
+    if (s.online_host && step == OnlineStep::Failed) {
+        if (Button("##online-new", c, right - 140, by, right, by + 36, "New invite", true)) s.NewInvite();
+    } else if (Button("##online-start", c, right - 140, by, right, by + 36, s.online_host ? "Host" : "Join", true, ready)) {
+        s.StartOnline();
+    }
+    if (Button("##online-close", c, right - 140 - 12 - 96, by, right - 140 - 12, by + 36, "Close", false)) s.online_open = false;
+}
+
 void GamePage(Session& s, const Canvas& c, float W, float H) {
     const float right = W - 48;
     Header(c, s.game_required ? "Choose your game" : "Change game", "Use your own copy of the original USA/Europe Xbox release.");
@@ -884,7 +1026,8 @@ void Draw(Session& s, float scale) {
     const float footer = H - 76;
     art::Background(c, W, H, s.page == Page::Play ? ImVec2(W / 2, 96 + (footer - 96) / 2) : ImVec2(W / 2, -80));
     const bool modal = s.popup.has_value();
-    ImGui::BeginDisabled(modal);
+    const bool panel = s.online_open && s.page == Page::Play;
+    ImGui::BeginDisabled(modal || panel);
     TopBar(s, c, W);
     switch (s.page) {
         case Page::Play: PlayPage(s, c, W, H); break;
@@ -895,7 +1038,18 @@ void Draw(Session& s, float scale) {
     }
     ImGui::EndDisabled();
     ImGui::End();
-    // The popup has its own window, above the page and its scrolling list.
+    // The online panel and the popup have their own windows, above the page; a popup stays on top.
+    if (panel) {
+        ImGui::SetNextWindowPos(viewport->Pos);
+        ImGui::SetNextWindowSize(viewport->Size);
+        if (!modal) ImGui::SetNextWindowFocus();
+        ImGui::Begin("##online", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                          ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
+        ImGui::BeginDisabled(modal);
+        OnlinePanel(s, Canvas{ImGui::GetWindowDrawList(), scale, viewport->Pos}, W, H);
+        ImGui::EndDisabled();
+        ImGui::End();
+    }
     if (modal) {
         ImGui::SetNextWindowPos(viewport->Pos);
         ImGui::SetNextWindowSize(viewport->Size);
@@ -913,6 +1067,8 @@ void Draw(Session& s, float scale) {
         else if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
             if (s.popup->confirm.empty()) s.Dismiss(); else s.Accept();
         }
+    } else if (panel) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) s.online_open = false;
     } else if (!modal && !io.NavVisible) {
         if (s.page == Page::Play && !ImGui::GetIO().WantTextInput && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) s.Play();
         else if (s.page == Page::Game && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) s.LeaveGame();
@@ -948,6 +1104,11 @@ public:
         if (s.popup) {
             if (pressed[0]) { if (s.popup->confirm.empty()) s.Dismiss(); else s.Accept(); }
             else if (pressed[1]) s.Dismiss();
+            return;
+        }
+        // Codes are pasted with the keyboard or mouse; B closes the panel.
+        if (s.online_open && s.page == Page::Play) {
+            if (pressed[1]) s.online_open = false;
             return;
         }
         if (s.page == Page::Game) {
@@ -1051,6 +1212,7 @@ private:
             if (argument == "offline") s.netplay_mode = 0;
             else if (argument == "host") { if (s.netplay_mode != 1) s.GatherHostAddresses(); s.netplay_mode = 1; }
             else if (argument == "join") s.netplay_mode = 2;
+            else if (argument == "online") s.netplay_mode = 3;
         }
         else if (command == "netplay-endpoint") {
             std::snprintf(s.netplay_endpoint, sizeof(s.netplay_endpoint), "%s", argument.c_str());

@@ -277,4 +277,26 @@ void SubmitAudio(const float* stereo, uint32_t frames, uint32_t rate);
 // Client side: runs the viewer window until it closes. Returns the process exit code.
 int RunClient(const std::string& host, uint16_t port);
 
+// Internet play. The launcher exchanges the connection codes in the same process before the session
+// starts; StartHost and RunClient then use the prepared connection instead of a LAN socket.
+enum class OnlineStep {
+    Idle,
+    Preparing,  // gathering this computer's addresses
+    Waiting,    // host: the invite is ready, waiting for the reply code
+    Connecting, // codes exchanged; Player 2 can start, and the host can start once a reply is accepted
+    Connected,
+    Failed,
+};
+struct OnlineStatus {
+    OnlineStep step = OnlineStep::Idle;
+    bool host = false;
+    std::string code;  // the invite (host) or the reply (Player 2) to send to the other player
+    std::string error;
+};
+void CreateInvite();
+bool AcceptReply(const std::string& reply, std::string& error);
+bool JoinInvite(const std::string& invite, std::string& error);
+OnlineStatus Online();
+void CancelOnline();
+
 } // namespace openshao::stream

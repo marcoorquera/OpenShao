@@ -72,3 +72,8 @@ Distributed under 0BSD. See xz-embedded-0BSD.txt for the complete license.
 Lua 5.4.9 (https://www.lua.org/)
 Copyright (c) 1994-2026 Lua.org, PUC-Rio.
 Distributed under MIT. See Lua-MIT.txt for the complete license.
+
+libjuice v1.7.4 (https://github.com/paullouisageneau/libjuice)
+Copyright (C) Paul-Louis Ageneau and contributors.
+Distributed under Mozilla Public License 2.0, see libjuice-MPL-2.0.txt.
+

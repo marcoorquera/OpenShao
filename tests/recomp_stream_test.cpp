@@ -1,4 +1,7 @@
 #include "stream.h"
+#include "stream_invite.h"
+#define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
+#include <miniz.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -465,6 +468,143 @@ int main() {
         Check(reset.packets_expected == 1 && reset.packets_received == 1, "Reset starts a new count");
     }
 
-    std::puts("PASS: stream packet framing, chunking, frame reassembly, Opus audio and NV12 conversion");
+    // 13. Connection codes (Invite & Reply), whitespace tolerance and error handling
+    {
+        ConnectionCode invite{};
+        invite.kind = CodeKind::Invite;
+        invite.session = 0x12345678u;
+        invite.description =
+            "a=ice-ufrag:abcd1234\r\n"
+            "a=ice-pwd:xyz987654321xyz987654321\r\n"
+            "a=ice-options:trickle\r\n"
+            "a=candidate:1 1 UDP 2130706431 192.168.1.50 50000 typ host\r\n"
+            "a=candidate:2 1 UDP 1694498815 203.0.113.5 50000 typ srflx raddr 192.168.1.50 rport 50000\r\n"
+            "a=end-of-candidates\r\n";
+
+        std::string encoded_invite = EncodeCode(invite);
+        Check(!encoded_invite.empty(), "invite encodes successfully");
+        Check(encoded_invite.size() < 400, "typical invite code stays under 400 characters");
+        std::printf("Typical invite code length: %zu characters\n", encoded_invite.size());
+
+        // Round trip of invite
+        ConnectionCode decoded_invite{};
+        std::string error;
+        Check(DecodeCode(encoded_invite, CodeKind::Invite, decoded_invite, error), "invite decodes successfully");
+        Check(decoded_invite.kind == CodeKind::Invite, "decoded invite kind matches");
+        Check(decoded_invite.session == invite.session, "decoded invite session matches");
+        Check(decoded_invite.description.find("a=ice-options") == std::string::npos,
+              "dropped line (a=ice-options) is gone after decoding");
+        Check(decoded_invite.description.find("a=ice-ufrag:abcd1234") != std::string::npos, "ufrag preserved");
+        Check(decoded_invite.description.find("a=ice-pwd:xyz987654321xyz987654321") != std::string::npos,
+              "pwd preserved");
+        Check(decoded_invite.description.find("a=end-of-candidates") != std::string::npos, "end marker preserved");
+
+        // Round trip of reply
+        ConnectionCode reply{};
+        reply.kind = CodeKind::Reply;
+        reply.session = invite.session;
+        reply.description = invite.description;
+        std::string encoded_reply = EncodeCode(reply);
+        Check(!encoded_reply.empty(), "reply encodes successfully");
+        ConnectionCode decoded_reply{};
+        Check(DecodeCode(encoded_reply, CodeKind::Reply, decoded_reply, error), "reply decodes successfully");
+        Check(decoded_reply.kind == CodeKind::Reply, "decoded reply kind matches");
+        Check(decoded_reply.session == reply.session, "decoded reply session matches");
+        Check(decoded_reply.description == decoded_invite.description,
+              "decoded reply description matches decoded invite");
+
+        // Whitespace and line breaks inserted into the code are ignored
+        std::string spaced_code;
+        for (size_t i = 0; i < encoded_invite.size(); ++i) {
+            spaced_code.push_back(encoded_invite[i]);
+            if (i % 15 == 0) {
+                spaced_code.append("\r\n  \t ");
+            }
+        }
+        ConnectionCode decoded_spaced{};
+        Check(DecodeCode(spaced_code, CodeKind::Invite, decoded_spaced, error),
+              "code with whitespace and line breaks decodes successfully");
+        Check(decoded_spaced.session == invite.session && decoded_spaced.description == decoded_invite.description,
+              "whitespace content matches");
+
+        // Wrong kind: paste reply into invite
+        ConnectionCode bad_code{};
+        Check(!DecodeCode(encoded_reply, CodeKind::Invite, bad_code, error),
+              "reply code rejected when expecting invite");
+        Check(error == "This is a reply code. Paste it on the host.", "wrong kind message for reply -> invite");
+
+        // Wrong kind: paste invite into reply
+        Check(!DecodeCode(encoded_invite, CodeKind::Reply, bad_code, error),
+              "invite code rejected when expecting reply");
+        Check(error == "This is an invite code. Paste it in Join.", "wrong kind message for invite -> reply");
+
+        // Wrong version digit
+        std::string wrong_ver_digit = encoded_invite;
+        wrong_ver_digit[3] = '9';
+        Check(!DecodeCode(wrong_ver_digit, CodeKind::Invite, bad_code, error), "wrong version digit rejected");
+        Check(error == "This code comes from a different OpenShao version. Both players need the same version.",
+              "wrong version digit message");
+
+        // Wrong kVersion in body
+        {
+            std::string desc = "a=ice-ufrag:abcd1234\r\na=ice-pwd:xyz\r\n";
+            std::vector<uint8_t> body(6 + desc.size());
+            uint16_t wrong_kver = 999;
+            body[0] = uint8_t(wrong_kver & 0xFF);
+            body[1] = uint8_t((wrong_kver >> 8) & 0xFF);
+            body[2] = 0x78; body[3] = 0x56; body[4] = 0x34; body[5] = 0x12;
+            std::memcpy(body.data() + 6, desc.data(), desc.size());
+            mz_ulong dlen = mz_compressBound(static_cast<mz_ulong>(body.size()));
+            std::vector<uint8_t> comp(dlen);
+            mz_compress2(comp.data(), &dlen, body.data(), static_cast<mz_ulong>(body.size()), 9);
+            comp.resize(dlen);
+
+            // Base64url encode manually
+            const char b64c[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            std::string b64;
+            size_t idx = 0;
+            while (idx + 3 <= comp.size()) {
+                uint32_t val = (uint32_t(comp[idx]) << 16) | (uint32_t(comp[idx + 1]) << 8) | uint32_t(comp[idx + 2]);
+                b64.push_back(b64c[(val >> 18) & 0x3F]);
+                b64.push_back(b64c[(val >> 12) & 0x3F]);
+                b64.push_back(b64c[(val >> 6) & 0x3F]);
+                b64.push_back(b64c[val & 0x3F]);
+                idx += 3;
+            }
+            if (idx + 1 == comp.size()) {
+                uint32_t val = uint32_t(comp[idx]) << 16;
+                b64.push_back(b64c[(val >> 18) & 0x3F]);
+                b64.push_back(b64c[(val >> 12) & 0x3F]);
+            } else if (idx + 2 == comp.size()) {
+                uint32_t val = (uint32_t(comp[idx]) << 16) | (uint32_t(comp[idx + 1]) << 8);
+                b64.push_back(b64c[(val >> 18) & 0x3F]);
+                b64.push_back(b64c[(val >> 12) & 0x3F]);
+                b64.push_back(b64c[(val >> 6) & 0x3F]);
+            }
+            std::string bad_ver_code = "OSI1-" + b64;
+            Check(!DecodeCode(bad_ver_code, CodeKind::Invite, bad_code, error),
+                  "wrong body kVersion rejected");
+            Check(error == "This code comes from a different OpenShao version. Both players need the same version.",
+                  "wrong body kVersion message");
+        }
+
+        // Truncated text
+        std::string truncated = encoded_invite.substr(0, encoded_invite.size() / 2);
+        Check(!DecodeCode(truncated, CodeKind::Invite, bad_code, error), "truncated code rejected");
+        Check(error == "The connection code is damaged or incomplete.", "truncated code error message");
+
+        // Invalid base64 characters
+        std::string invalid_b64 = encoded_invite;
+        invalid_b64.back() = '!';
+        Check(!DecodeCode(invalid_b64, CodeKind::Invite, bad_code, error), "invalid base64 characters rejected");
+        Check(error == "The connection code is damaged or incomplete.", "invalid base64 characters error message");
+
+        // Non-OpenShao string
+        Check(!DecodeCode("https://example.com/not-a-code", CodeKind::Invite, bad_code, error),
+              "non-OpenShao string rejected");
+        Check(error == "Not an OpenShao connection code.", "non-OpenShao string error message");
+    }
+
+    std::puts("PASS: stream packet framing, chunking, frame reassembly, Opus audio, NV12 conversion and connection codes");
     return 0;
 }

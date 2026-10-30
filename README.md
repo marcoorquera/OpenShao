@@ -44,7 +44,7 @@ This fork builds on the upstream [OpenShao](https://github.com/OAleex/OpenShao) 
 2. Right-click the `.zip` archive and extract it to a folder on your PC (for example, `C:\Games\OpenShao`).
 3. Run `OpenShao.exe` once to open the launcher.
 4. Select your USA/Europe Xbox game copy (an ISO, XISO, ZIP, extracted folder or `default.xbe`).
-5. Click **Play** to start single-player or local Ko-op, or select **Host** to invite a second player over LAN streaming.
+5. Click **Play** to start single-player or local Ko-op. Select **Host** to invite a second player over LAN streaming, or **Online** to invite one over the internet.
 
 Keep the game image or folder where it is. OpenShao reads it in place.
 
@@ -173,6 +173,25 @@ The host runs the only copy of the game in local Ko-op. It sends video and audio
 Alternatively, run `.\OpenShao.exe --no-launcher --stream-host 27886` on the host and `.\OpenShao.exe --no-launcher --stream-join <host-ip>:27886` on Player 2.
 
 Player 2 joins the host as one more gamepad. It becomes Player 2 behind the host's first gamepad. Player 2 can use the default OpenShao keyboard keys in the viewer window. Press F11 or Alt+Enter in the viewer window to switch to full screen.
+
+### How do I stream over the internet?
+
+**Online** mode streams the same way over the internet. The players exchange two codes through any chat app. No port forwarding is needed. Both players need the same OpenShao version. Online mode is available on Windows.
+
+1. On the host PC, select **Online** in the launcher.
+2. Select **Invite a friend**.
+3. Copy the invite code and send it to Player 2.
+4. On the Player 2 PC, select **Online** in the launcher.
+5. Select **Join a friend**.
+6. Paste the invite code.
+7. Copy the reply code and send it to the host.
+8. Select **Join**.
+9. On the host PC, paste the reply code.
+10. Select **Host** to start the game.
+
+Each code works for one session. Create a new invite for the next session.
+
+Online mode connects the two PCs directly. Some networks block direct connections, for example some mobile and company networks. On those networks, use LAN streaming over a virtual private network.
 
 ### How do I install mods or the Portuguese language pack?
 

@@ -41,6 +41,17 @@ The build pins revision `174573d60290f447c13a2b1b3405de2b96e27d6c`.
 It checks the source download's SHA-256 hash.
 See the [miniz license](licenses/miniz-MIT.txt).
 
+## Streaming
+
+The Windows streaming code uses these libraries. The build checks each source download's SHA-256 hash.
+
+- [Opus 1.5.2](https://opus-codec.org/) encodes the audio, under the BSD 3-Clause license. See the [Opus license](licenses/opus.txt).
+- [miniupnpc 2.2.8](https://github.com/miniupnp/miniupnp) maps the LAN host port, under the BSD 3-Clause license. See the [miniupnpc license](licenses/miniupnpc.txt).
+- [libjuice 1.7.4](https://github.com/paullouisageneau/libjuice) connects internet sessions with ICE and STUN, under the Mozilla Public License 2.0. See the [libjuice license](licenses/libjuice-MPL-2.0.txt).
+
+Internet sessions query the public STUN server `stun.l.google.com:19302` for each player's public address.
+Media Foundation, which is part of Windows, encodes and decodes the video.
+
 The build applies a local fix for ZIP64 entries with extended file offsets.
 The adaptation preserves the pinned download. Extraction still checks file bounds and CRC values.
 
