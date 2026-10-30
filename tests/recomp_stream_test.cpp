@@ -193,6 +193,16 @@ int main() {
     {
         Check(VideoScale(640, 480) == 1 && VideoScale(1280, 960) == 1, "native guest sizes are not scaled");
         Check(VideoScale(2560, 1920) == 2 && VideoScale(1281, 960) == 2, "oversized captures are halved");
+        uint32_t cw = 0, ch = 0;
+        CaptureSize(640, 480, cw, ch);
+        Check(cw == 640 && ch == 480, "a guest-sized frame is captured unchanged");
+        CaptureSize(1920, 1440, cw, ch);
+        Check(cw == 1280 && ch == 960, "a 3x render shrinks to the stream limit");
+        CaptureSize(2560, 1440, cw, ch);
+        Check(cw == 1280 && ch == 720, "a wide render keeps its aspect ratio");
+        CaptureSize(1999, 1499, cw, ch);
+        Check(cw <= kVideoMaxWidth && ch <= kVideoMaxHeight && cw % 2 == 0 && ch % 2 == 0 && VideoScale(cw, ch) == 1,
+              "a shrunk capture is even and needs no further scaling");
 
         const uint8_t colors[][3] = {{0, 0, 0}, {255, 255, 255}, {200, 30, 40}, {20, 180, 60}, {30, 60, 220}, {128, 128, 128}};
         for (const auto& color : colors) {
@@ -336,21 +346,23 @@ int main() {
 
     // 11. BitrateController rate adaptation, clamps, limits, and small report handling
     {
-        BitrateController bc(kVideoBitrate);
-        Check(bc.Bitrate() == kVideoBitrate, "initial bitrate matches start");
+        constexpr uint32_t start = 8'000'000;
+        static_assert(start <= kMaxVideoBitrate);
+        BitrateController bc(start);
+        Check(bc.Bitrate() == start, "initial bitrate matches start");
 
         // Small reports (< 20 chunks expected) are ignored
         StreamStats small{};
-        small.chunks_expected = 19;
-        small.chunks_received = 0;
+        small.packets_expected = 19;
+        small.packets_received = 0;
         small.frames_lost = 5;
         bc.Update(small, 1000);
-        Check(bc.Bitrate() == kVideoBitrate, "reports with chunks_expected < 20 are ignored");
+        Check(bc.Bitrate() == start, "reports with packets_expected < 20 are ignored");
 
         // Loss > 5% drops bitrate by 25%, rate-limited to once per 1000 ms
         StreamStats lossy{};
-        lossy.chunks_expected = 100;
-        lossy.chunks_received = 90; // 10% loss
+        lossy.packets_expected = 100;
+        lossy.packets_received = 90; // 10% loss
         lossy.frames_lost = 0;
         bc.Update(lossy, 1000);
         Check(bc.Bitrate() == 6'000'000, "10% loss drops 8 Mbps to 6 Mbps");
@@ -361,8 +373,8 @@ int main() {
 
         // frames_lost > 0 triggers drop even with 0% chunk loss
         StreamStats lost_frame{};
-        lost_frame.chunks_expected = 100;
-        lost_frame.chunks_received = 100;
+        lost_frame.packets_expected = 100;
+        lost_frame.packets_received = 100;
         lost_frame.frames_lost = 1;
         bc.Update(lost_frame, 3000);
         Check(bc.Bitrate() == 3'375'000, "frames_lost > 0 drops bitrate");
@@ -377,8 +389,8 @@ int main() {
 
         // Clean reports (< 1% loss, no frames lost) raise rate after 3000 ms in a row, at most once per 2000 ms
         StreamStats clean{};
-        clean.chunks_expected = 100;
-        clean.chunks_received = 100;
+        clean.packets_expected = 100;
+        clean.packets_received = 100;
         clean.frames_lost = 0;
         bc.Update(clean, 10000); // streak starts at 10000
         Check(bc.Bitrate() == kMinVideoBitrate, "clean report before 3000 ms does not raise rate");
@@ -393,8 +405,8 @@ int main() {
 
         // Broken clean streak resets 3000 ms requirement
         StreamStats mild_loss{};
-        mild_loss.chunks_expected = 100;
-        mild_loss.chunks_received = 98; // 2% loss: between 1% and 5% -> not clean, breaks streak
+        mild_loss.packets_expected = 100;
+        mild_loss.packets_received = 98; // 2% loss: between 1% and 5% -> not clean, breaks streak
         mild_loss.frames_lost = 0;
         bc.Update(mild_loss, 16000);
         Check(bc.Bitrate() == 2'420'000, "mild loss does not drop rate");
@@ -404,13 +416,53 @@ int main() {
         bc.Update(clean, 20000); // 3000 ms clean -> raise 2420000 * 1.10 = 2662000
         Check(bc.Bitrate() == 2'662'000, "clean for 3000 ms after break raises rate");
 
-        // Upper clamp holds at kMaxVideoBitrate (8,000,000)
+        // Upper clamp holds at kMaxVideoBitrate
         uint32_t t = 22000;
         for (int i = 0; i < 20; ++i) {
             bc.Update(clean, t);
             t += 2000;
         }
         Check(bc.Bitrate() == kMaxVideoBitrate, "bitrate clamps to kMaxVideoBitrate");
+    }
+
+    // 12. SequenceCounter loss accounting
+    {
+        // A report sent after a large frame's data but before its parity must show no loss.
+        SequenceCounter sequence;
+        StreamStats first{};
+        for (uint32_t seq = 1000; seq < 1300; ++seq) sequence.Add(seq, first);
+        Check(first.packets_expected == 300 && first.packets_received == 300,
+              "packets still in flight are not expected yet");
+        StreamStats second{};
+        for (uint32_t seq = 1300; seq < 1338; ++seq) sequence.Add(seq, second);
+        Check(second.packets_expected == 38 && second.packets_received == 38,
+              "parity after a report is counted in the next report");
+
+        // Gaps count as loss; a reordered packet only adds to received.
+        StreamStats gaps{};
+        sequence.Add(1340, gaps);
+        sequence.Add(1339, gaps);
+        sequence.Add(1345, gaps);
+        // 1338 and 1341-1344 are missing
+        Check(gaps.packets_expected == 8 && gaps.packets_received == 3, "skipped sequence numbers count as lost");
+
+        // Sequence numbers wrap.
+        SequenceCounter wrap;
+        StreamStats wrapped{};
+        wrap.Add(0xFFFFFFFEu, wrapped);
+        wrap.Add(0xFFFFFFFFu, wrapped);
+        wrap.Add(0u, wrapped);
+        wrap.Add(1u, wrapped);
+        Check(wrapped.packets_expected == 4 && wrapped.packets_received == 4, "sequence wrap is not loss");
+
+        // A restart is not loss.
+        StreamStats restart{};
+        wrap.Add(5'000'000u, restart);
+        Check(restart.packets_expected == 1 && restart.packets_received == 1, "a large jump restarts the count");
+        wrap.Reset();
+        StreamStats reset{};
+        wrap.Add(7u, reset);
+        Check(reset.packets_expected == 1 && reset.packets_received == 1, "Reset starts a new count");
     }
 
     std::puts("PASS: stream packet framing, chunking, frame reassembly, Opus audio and NV12 conversion");

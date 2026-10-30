@@ -221,8 +221,8 @@ void HostNetwork() {
                     g_host.video_bitrate.store(new_rate, std::memory_order_release);
                     g_host.bitrate_changed.store(true, std::memory_order_release);
                     if (g_host.last_bitrate_log_ms == 0 || now - g_host.last_bitrate_log_ms >= 5000) {
-                        const double loss = (stats.chunks_expected > 0 && stats.chunks_received <= stats.chunks_expected)
-                            ? 100.0 * (1.0 - double(stats.chunks_received) / double(stats.chunks_expected))
+                        const double loss = (stats.packets_expected > 0 && stats.packets_received <= stats.packets_expected)
+                            ? 100.0 * (1.0 - double(stats.packets_received) / double(stats.packets_expected))
                             : 0.0;
                         LOGI("stream: video bitrate %u kbps (loss %.1f%%)", new_rate / 1000, loss);
                         g_host.last_bitrate_log_ms = now;
@@ -419,6 +419,7 @@ void ClientNetwork(Client& c) {
     uint32_t last_frame = 0, last_request = 0;
     uint32_t last_stats = NowMs();
     StreamStats stats{};
+    SequenceCounter sequence;
     uint32_t last_assembler_dropped = 0;
     uint32_t last_assembler_recovered = 0;
     uint32_t last_seen_frame_id = 0;
@@ -439,15 +440,14 @@ void ClientNetwork(Client& c) {
         const uint8_t* payload = nullptr;
         const uint32_t now = NowMs();
         if (waiting_keyframe) request_keyframe();
-        if (c.connected.load(std::memory_order_acquire) &&
-            now - last_stats >= kStatsIntervalMs &&
-            (!assembler.IsActive() || now - last_stats >= kStatsIntervalMs + 50)) {
+        if (c.connected.load(std::memory_order_acquire) && now - last_stats >= kStatsIntervalMs) {
             ClientSend(c, PacketType::Stats, 0, &stats, sizeof(stats));
             stats = StreamStats{};
             last_stats = now;
         }
         if (n <= 0 || !SameAddress(from, c.host) || !ParsePacket(buffer.data(), size_t(n), header, payload)) continue;
         c.last_packet.store(NowMs(), std::memory_order_release);
+        if (c.connected.load(std::memory_order_acquire)) sequence.Add(header.seq, stats);
         const auto type = PacketType(header.type);
         if (type == PacketType::Welcome) {
             if (!c.connected.exchange(true)) {
@@ -457,6 +457,7 @@ void ClientNetwork(Client& c) {
                 last_request = NowMs() - kKeyframeRequestMs;
                 last_stats = NowMs();
                 stats = StreamStats{};
+                sequence.Reset();
                 last_assembler_dropped = assembler.Dropped();
                 last_assembler_recovered = assembler.Recovered();
                 has_seen_frame_id = false;
@@ -468,13 +469,11 @@ void ClientNetwork(Client& c) {
             std::memcpy(&chunk, payload, sizeof(chunk));
             if (chunk.codec != kVideoCodecH264 || !media) continue;
 
-            stats.chunks_received++;
             if (!has_seen_frame_id || int32_t(chunk.frame - last_seen_frame_id) > 0) {
                 if (has_seen_frame_id) {
                     const int32_t diff = int32_t(chunk.frame - last_seen_frame_id);
                     if (diff > 1) stats.frames_lost += uint32_t(diff - 1);
                 }
-                stats.chunks_expected += uint32_t(chunk.count + chunk.fec_count);
                 last_seen_frame_id = chunk.frame;
                 has_seen_frame_id = true;
             }
@@ -532,6 +531,7 @@ void ClientNetwork(Client& c) {
             has_frame = false;
             has_seen_frame_id = false;
             stats = StreamStats{};
+            sequence.Reset();
             if (c.connected.exchange(false)) LOGI("stream: host closed the session");
             PostMessageW(c.window, WM_APP + 1, 0, 0);
         }

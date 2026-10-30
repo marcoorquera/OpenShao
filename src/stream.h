@@ -27,7 +27,7 @@ inline constexpr uint32_t kAudioResyncPackets = 50; // 500 ms
 inline constexpr uint8_t kVideoCodecH264 = 1;
 inline constexpr uint8_t kVideoFlagKeyframe = 1;
 inline constexpr uint32_t kVideoFrameRate = 60;
-inline constexpr uint32_t kVideoBitrate = 8'000'000;
+inline constexpr uint32_t kVideoBitrate = 12'000'000;
 inline constexpr uint32_t kVideoGopFrames = 240;    // a periodic keyframe repairs any missed request
 inline constexpr uint32_t kVideoMaxWidth = 1280;
 inline constexpr uint32_t kVideoMaxHeight = 960;
@@ -84,8 +84,8 @@ struct AudioChunk {
 };
 
 struct StreamStats {
-    uint32_t chunks_received = 0;  // video chunks (data + parity) since the last Stats
-    uint32_t chunks_expected = 0;  // data + parity chunks of every frame id seen since the last Stats
+    uint32_t packets_received = 0;  // host packets since the last Stats
+    uint32_t packets_expected = 0;  // host sequence numbers passed since the last Stats
     uint32_t frames_recovered = 0; // frames completed thanks to parity
     uint32_t frames_lost = 0;      // frame ids skipped or never completed
 };
@@ -105,6 +105,9 @@ void BuildParity(const uint8_t* data, size_t total, uint16_t count, uint8_t grou
 
 // Integer downscale factor that fits a captured frame inside kVideoMaxWidth x kVideoMaxHeight.
 uint32_t VideoScale(uint32_t width, uint32_t height);
+// Size that the GPU shrinks a rendered frame to before readback: the largest even size inside
+// kVideoMaxWidth x kVideoMaxHeight with the frame's aspect ratio. It never enlarges the frame.
+void CaptureSize(uint32_t width, uint32_t height, uint32_t& out_width, uint32_t& out_height);
 // BT.709 limited range. BgraToNv12 box-filters by `scale` and rounds the output size down to even.
 void BgraToNv12(const uint8_t* bgra, uint32_t pitch, uint32_t width, uint32_t height, uint32_t scale,
                 std::vector<uint8_t>& nv12, uint32_t& out_width, uint32_t& out_height);
@@ -230,6 +233,18 @@ private:
     std::vector<bool> have_;
     std::vector<bool> have_parity_;
     std::vector<uint8_t> parity_data_;
+};
+
+// Counts host packets for StreamStats by header sequence number. A packet counts as expected only
+// once a later one arrives, so a report sent while a frame's parity is still in flight shows no loss.
+class SequenceCounter {
+public:
+    void Add(uint32_t seq, StreamStats& stats);
+    void Reset() { started_ = false; }
+
+private:
+    bool started_ = false;
+    uint32_t highest_ = 0;
 };
 
 class BitrateController {

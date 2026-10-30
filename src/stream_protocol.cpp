@@ -118,6 +118,16 @@ uint32_t VideoScale(uint32_t width, uint32_t height) {
     return scale;
 }
 
+void CaptureSize(uint32_t width, uint32_t height, uint32_t& out_width, uint32_t& out_height) {
+    out_width = width;
+    out_height = height;
+    if (!width || !height) return;
+    const double f = std::min({1.0, double(kVideoMaxWidth) / width, double(kVideoMaxHeight) / height});
+    if (f >= 1.0) return;
+    out_width = std::max(2u, uint32_t(width * f) & ~1u);
+    out_height = std::max(2u, uint32_t(height * f) & ~1u);
+}
+
 namespace {
 
 uint8_t Clamp8(int v) { return uint8_t(v < 0 ? 0 : v > 255 ? 255 : v); }
@@ -325,15 +335,31 @@ bool FrameAssembler::Add(const VideoChunk& chunk, const uint8_t* data, size_t si
     return true;
 }
 
+void SequenceCounter::Add(uint32_t seq, StreamStats& stats) {
+    ++stats.packets_received;
+    const int32_t ahead = int32_t(seq - highest_);
+    // A jump this large comes from a restarted host count or a stale packet, not from loss.
+    if (!started_ || ahead > 65536 || ahead < -65536) {
+        started_ = true;
+        highest_ = seq;
+        ++stats.packets_expected;
+        return;
+    }
+    // A reordered packet was already expected when a later one arrived.
+    if (ahead <= 0) return;
+    stats.packets_expected += uint32_t(ahead);
+    highest_ = seq;
+}
+
 BitrateController::BitrateController(uint32_t start)
     : bitrate_(std::clamp(start, kMinVideoBitrate, kMaxVideoBitrate)) {}
 
 uint32_t BitrateController::Update(const StreamStats& s, uint32_t now_ms) {
-    if (s.chunks_expected < 20) return bitrate_;
+    if (s.packets_expected < 20) return bitrate_;
 
-    const double loss = (s.chunks_received >= s.chunks_expected)
+    const double loss = (s.packets_received >= s.packets_expected)
         ? 0.0
-        : 1.0 - double(s.chunks_received) / double(s.chunks_expected);
+        : 1.0 - double(s.packets_received) / double(s.packets_expected);
 
     const bool lossy = (loss > 0.05 || s.frames_lost > 0);
     const bool clean = (loss < 0.01 && s.frames_lost == 0);
