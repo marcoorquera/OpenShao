@@ -38,6 +38,20 @@ def platform_of(exe):
     raise ValueError(f'{exe} is neither a Windows nor a Linux executable')
 
 
+def project_version(root):
+    """The version in CMakeLists.txt, which the executable reports to the updater."""
+    text = (root / 'CMakeLists.txt').read_text(encoding='utf-8')
+    found = re.search(r'project\(\s*OpenShao\s+VERSION\s+(\S+)', text)
+    if not found:
+        raise ValueError('CMakeLists.txt does not declare the project version')
+    # The launcher compares RecompVersion with the latest release tag.
+    header = (root / 'src/mods/version.h').read_text(encoding='utf-8')
+    recomp = re.search(r'RecompVersion\s*=\s*"([^"]+)"', header)
+    if not recomp or recomp.group(1) != found.group(1):
+        raise ValueError('src/mods/version.h RecompVersion must match the CMakeLists.txt project version')
+    return found.group(1)
+
+
 def check_version(version):
     if not re.fullmatch(r'\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?', version):
         raise ValueError('Use major.minor.patch with an optional prerelease suffix')
@@ -80,14 +94,16 @@ def linux_package(root, exe, output, version):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exe', required=True, type=Path)
-    parser.add_argument('--version', default='0.3.0')
+    # The updater looks for the package named after the release tag, so the name must carry the
+    # version the executable was built with.
+    parser.add_argument('--version', help='defaults to the project version in CMakeLists.txt')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     exe = args.exe.resolve(strict=True)
     output = args.output.resolve() if args.output else root / 'dist'
     package = linux_package if platform_of(exe) == 'linux' else portable_package
-    print(package(root, exe, output, args.version))
+    print(package(root, exe, output, args.version or project_version(root)))
 
 
 if __name__ == '__main__':

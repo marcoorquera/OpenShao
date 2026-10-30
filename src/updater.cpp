@@ -186,7 +186,7 @@ Release ParseLatest(std::string_view text) {
         if (!asset.Has("name") || !asset.Has("browser_download_url")) continue;
         const auto& name = asset.At("name").Text();
         const auto& url = asset.At("browser_download_url").Text();
-        if (!url.starts_with("https://github.com/OAleex/OpenShao/releases/download/")) continue;
+        if (!url.starts_with("https://github.com/marcoorquera/OpenShao/releases/download/")) continue;
         if (name == "checksums.txt") release.checksums_url = url;
         if (name != release.package_name) continue;
         release.package_url = url;
