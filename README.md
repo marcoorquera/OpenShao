@@ -56,7 +56,7 @@ Keep the game image or folder where it is. OpenShao reads it in place.
 4. Select **Host** to start the game.
    *(If Windows Defender Firewall prompts for access, allow UDP port `27886`.)*
 5. On the Player 2 PC, open `OpenShao.exe`. Player 2 does not need a game copy.
-6. Select **Join** in the launcher.
+6. Select **Join** in the launcher. Without a game copy, select **Join a friend without the game** first.
 7. Enter the host IPv4 address shown on the host launcher's info line.
 8. Select **Join** to connect to the host.
 9. Wait for Player 2 to connect before choosing **Ko-op** in the main menu.
@@ -163,7 +163,7 @@ Lockstep netplay can desynchronize during gameplay. LAN streaming avoids this.
 
 ### How does LAN streaming work?
 
-The host runs the only copy of the game in local Ko-op. It sends video and audio to Player 2 over UDP port `27886`. Player 2 sends a gamepad or keyboard state back. Player 2 does not need the game. LAN streaming is available on Windows.
+The host runs the only copy of the game in local Ko-op. It sends video and audio to Player 2 over UDP port `27886`. Player 2 sends a gamepad or keyboard state back. Player 2 does not need the game. LAN streaming is available on Windows. On Linux, Player 2 can run the Windows package through Proton.
 
 1. On the host PC, select **Host** in the launcher and start the game.
 2. On the Player 2 PC, select **Join** in the launcher.
@@ -172,7 +172,11 @@ The host runs the only copy of the game in local Ko-op. It sends video and audio
 
 Alternatively, run `.\OpenShao.exe --no-launcher --stream-host 27886` on the host and `.\OpenShao.exe --no-launcher --stream-join <host-ip>:27886` on Player 2.
 
-Player 2 joins the host as one more gamepad. It becomes Player 2 behind the host's first gamepad. Player 2 can use the default OpenShao keyboard keys in the viewer window. Press F11 or Alt+Enter in the viewer window to switch to full screen.
+Player 2 joins the host as one more gamepad. It becomes Player 2 behind the host's first gamepad. Player 2 can use the default OpenShao keyboard keys in the viewer window. To switch the viewer window to full screen, press F11 or Alt+Enter, or double-click it. On a touch screen, double-tap it.
+
+The viewer window shows the round-trip time to the host in milliseconds. It shows the picture in the host's aspect ratio. To fill a widescreen display, select a widescreen **Aspect ratio** on the host.
+
+Both players need the same OpenShao version.
 
 ### How do I stream over the internet?
 
@@ -181,7 +185,7 @@ Player 2 joins the host as one more gamepad. It becomes Player 2 behind the host
 1. On the host PC, select **Online** in the launcher.
 2. Select **Invite a friend**.
 3. Copy the invite code and send it to Player 2.
-4. On the Player 2 PC, select **Online** in the launcher.
+4. On the Player 2 PC, select **Online** in the launcher. Without a game copy, select **Join a friend without the game**.
 5. Select **Join a friend**.
 6. Paste the invite code.
 7. Copy the reply code and send it to the host.

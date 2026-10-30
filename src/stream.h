@@ -14,7 +14,7 @@ namespace openshao::stream {
 
 inline constexpr uint16_t kDefaultPort = 27886;
 inline constexpr uint32_t kMagic = 0x5453484Fu; // 'OHST'
-inline constexpr uint8_t kVersion = 4;
+inline constexpr uint8_t kVersion = 5;
 // Keeps every datagram below a 1280-byte IPv6 minimum MTU.
 inline constexpr size_t kMaxChunk = 1180;
 inline constexpr uint32_t kPeerTimeoutMs = 3000;
@@ -34,6 +34,7 @@ inline constexpr uint32_t kVideoMaxHeight = 960;
 inline constexpr uint32_t kKeyframeRequestMs = 250;
 inline constexpr uint8_t kFecGroup = 8;
 inline constexpr uint32_t kStatsIntervalMs = 500;
+inline constexpr uint32_t kPingIntervalMs = 500;
 inline constexpr uint32_t kMinVideoBitrate = 2'000'000;
 inline constexpr uint32_t kMaxVideoBitrate = kVideoBitrate;
 
@@ -45,7 +46,9 @@ enum class PacketType : uint8_t {
     Audio = 5,
     Bye = 6,
     KeyframeRequest = 7,
-    Stats = 8
+    Stats = 8,
+    Ping = 9, // Player 2 -> host; the host returns the payload in a Pong
+    Pong = 10
 };
 
 #pragma pack(push, 1)
@@ -74,6 +77,10 @@ struct VideoChunk {
     uint8_t flags = 0;
     uint8_t fec_group = 0;
     uint8_t fec_count = 0;
+    // Display width / height x 1000. The game draws widescreen modes anamorphically into a 4:3 target,
+    // so the pixel size alone does not give the shape; 0 means 4:3.
+    uint16_t aspect = 0;
+    uint16_t reserved = 0;
 };
 
 struct AudioChunk {
@@ -89,13 +96,18 @@ struct StreamStats {
     uint32_t frames_recovered = 0; // frames completed thanks to parity
     uint32_t frames_lost = 0;      // frame ids skipped or never completed
 };
+
+struct PingPayload {
+    uint32_t sent_ms = 0; // Player 2's clock; only Player 2 reads it back
+};
 #pragma pack(pop)
 
 static_assert(sizeof(Header) == 12, "stream header layout must remain fixed");
 static_assert(sizeof(RemotePad) == 16, "remote pad layout must remain fixed");
-static_assert(sizeof(VideoChunk) == 20, "video chunk layout must remain fixed");
+static_assert(sizeof(VideoChunk) == 24, "video chunk layout must remain fixed");
 static_assert(sizeof(AudioChunk) == 12, "audio chunk layout must remain fixed");
 static_assert(sizeof(StreamStats) == 16, "stream stats layout must remain fixed");
+static_assert(sizeof(PingPayload) == 4, "ping layout must remain fixed");
 
 bool ParsePacket(const uint8_t* data, size_t size, Header& header, const uint8_t*& payload);
 std::vector<uint8_t> BuildPacket(PacketType type, uint32_t seq, const void* payload, size_t size,
@@ -113,6 +125,19 @@ void BgraToNv12(const uint8_t* bgra, uint32_t pitch, uint32_t width, uint32_t he
                 std::vector<uint8_t>& nv12, uint32_t& out_width, uint32_t& out_height);
 void Nv12ToBgra(const uint8_t* y, const uint8_t* uv, uint32_t pitch, uint32_t width, uint32_t height,
                 std::vector<uint8_t>& bgra);
+
+// Round-trip time shown to Player 2, smoothed so a single late reply does not make it jump.
+class PingFilter {
+public:
+    uint32_t Add(uint32_t rtt_ms);
+    void Reset() { started_ = false; value_ = 0; }
+    bool Started() const { return started_; }
+    uint32_t Value() const { return value_; }
+
+private:
+    bool started_ = false;
+    uint32_t value_ = 0;
+};
 
 // Accumulates float stereo input into 10 ms (480-frame) Opus packets.
 class AudioEncoder {
@@ -271,7 +296,8 @@ bool ClientConnected();
 std::string PublicEndpoint();
 bool RemotePadState(RemotePad& pad);
 bool WantsVideo();
-void SubmitVideo(const uint8_t* bgra, uint32_t width, uint32_t height, uint32_t pitch);
+// aspect: the shape the host presents the frame with (width / height); 0 means 4:3.
+void SubmitVideo(const uint8_t* bgra, uint32_t width, uint32_t height, uint32_t pitch, float aspect = 0);
 void SubmitAudio(const float* stereo, uint32_t frames, uint32_t rate);
 
 // Client side: runs the viewer window until it closes. Returns the process exit code.

@@ -319,7 +319,7 @@ struct Session {
     void Launch(int mode, bool online) {
         if (options.configure_only) { Close(); return; }
         const bool join = mode == 2;
-        if (!join && source.empty()) { ChangeGame(); return; }
+        if (!join && source.empty()) { online_open = false; ChangeGame(); return; }
         if (!join && Busy()) {
             page = Page::Mods;
             Message("Mod operation in progress", "Wait for the mod operation to finish, or cancel it in Mods.");
@@ -420,6 +420,16 @@ struct Session {
     void LeaveGame() {
         if (game_required || preparing) return;
         page = game_return == Page::Game ? Page::Play : game_return;
+    }
+    // Player 2 only watches the host's stream, so joining needs no game. Play and Host still ask for one.
+    void JoinWithoutGame() {
+        if (preparing) return;
+        game_required = false;
+        game_error.clear();
+        page = Page::Play;
+        netplay_mode = 3;
+        SetOnlineRole(false);
+        OpenOnline();
     }
     // Applies a finished selection on the interface thread.
     void PollGame() {
@@ -960,6 +970,9 @@ void GamePage(Session& s, const Canvas& c, float W, float H) {
     const float right = W - 48;
     Header(c, s.game_required ? "Choose your game" : "Change game", "Use your own copy of the original USA/Europe Xbox release.");
     if (!s.game_required && Link("Back##game", c, right, 112, "Back", true, !s.preparing)) s.LeaveGame();
+#ifdef _WIN32
+    if (s.game_required && Link("Join##game", c, right, 112, "Join a friend without the game", true, !s.preparing)) s.JoinWithoutGame();
+#endif
     float y = 200;
     if (!s.game_error.empty()) {
         c.Text(Weight::Regular, 18.5f, 48, 172, Rgb(color::Warning), c.Fit(Weight::Regular, 18.5f, right - 48, s.game_error).c_str());
@@ -1193,6 +1206,7 @@ private:
             if (!s.game_required)
                 for (Page page : {Page::Play, Page::Mods, Page::Files, Page::About}) if (argument == PageName(page)) s.page = page;
         }
+        else if (command == "join-without-game") s.JoinWithoutGame();
         else if (command == "play") s.Play();
         else if (command == "close") s.Close();
         else if (command == "confirm") s.Accept();

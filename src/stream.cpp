@@ -16,6 +16,7 @@
 #include <mstcpip.h>
 #include <windows.h>
 #include <objbase.h>
+#include <timeapi.h>
 #include <wrl/client.h>
 #include <xaudio2.h>
 #include <SDL3/SDL.h>
@@ -32,6 +33,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -51,7 +53,7 @@ bool ClientConnected() { return false; }
 std::string PublicEndpoint() { return {}; }
 bool RemotePadState(RemotePad&) { return false; }
 bool WantsVideo() { return false; }
-void SubmitVideo(const uint8_t*, uint32_t, uint32_t, uint32_t) {}
+void SubmitVideo(const uint8_t*, uint32_t, uint32_t, uint32_t, float) {}
 void SubmitAudio(const float*, uint32_t, uint32_t) {}
 int RunClient(const std::string&, uint16_t) {
     LOGE("stream: LAN streaming is available on Windows");
@@ -86,6 +88,7 @@ constexpr uint32_t kPrefillAudio = 3;    // 30 ms of 10 ms packets
 constexpr uint32_t kMaxQueuedAudio = 12; // 120 ms of 10 ms packets
 constexpr uint32_t kAudioSlots = 64;
 constexpr uint32_t kReceiveTimeoutMs = 20;
+constexpr uint32_t kTimingLogMs = 5000;
 
 uint32_t NowMs() {
     return uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -198,6 +201,7 @@ struct Host {
     std::condition_variable frame_cv;
     std::vector<uint8_t> frame;
     uint32_t frame_w = 0, frame_h = 0;
+    uint16_t frame_aspect = 0;
     bool frame_ready = false;
     uint32_t frame_id = 0;
 
@@ -285,6 +289,10 @@ void HostNetwork() {
                         g_host.last_bitrate_log_ms = now;
                     }
                 }
+            } else if (type == PacketType::Ping && from_peer && header.size == sizeof(PingPayload)) {
+                g_host.last_seen = now;
+                guard.unlock();
+                HostSend(BuildPacket(PacketType::Pong, g_host.seq++, payload, sizeof(PingPayload)));
             } else if (type == PacketType::Bye && from_peer) {
                 guard.unlock();
                 HostDisconnect("left");
@@ -310,6 +318,7 @@ void HostEncoder() {
             encoder.SetBitrate(g_host.video_bitrate.load(std::memory_order_acquire));
         }
         uint32_t w = 0, h = 0;
+        uint16_t aspect = 0;
         {
             std::unique_lock guard(g_host.frame_lock);
             g_host.frame_cv.wait_for(guard, std::chrono::milliseconds(100), [] {
@@ -319,6 +328,7 @@ void HostEncoder() {
             pixels.swap(g_host.frame);
             w = g_host.frame_w;
             h = g_host.frame_h;
+            aspect = g_host.frame_aspect;
             g_host.frame_ready = false;
         }
         uint32_t ew = 0, eh = 0;
@@ -337,6 +347,7 @@ void HostEncoder() {
         chunk.total = uint32_t(encoded.size());
         chunk.count = ChunkCount(encoded.size());
         chunk.flags = key ? kVideoFlagKeyframe : 0;
+        chunk.aspect = aspect;
         // fec_count is 8 bits; a frame too large for it goes without parity.
         const uint32_t groups = (uint32_t(chunk.count) + kFecGroup - 1) / kFecGroup;
         chunk.fec_group = groups <= 255 ? kFecGroup : 0;
@@ -390,9 +401,21 @@ struct Client {
     std::atomic<bool> connected{false};
     std::atomic<uint32_t> last_packet{0};
 
+    // The network thread publishes decoded frames here; Paint takes them over so drawing never
+    // holds the lock that the network thread needs.
     std::mutex frame_lock;
     std::vector<uint8_t> frame;
     uint32_t frame_w = 0, frame_h = 0;
+    float frame_aspect = 4.f / 3.f;
+    bool frame_new = false;
+    std::vector<uint8_t> paint;  // interface thread only
+    uint32_t paint_w = 0, paint_h = 0;
+    float paint_aspect = 4.f / 3.f;
+    // Drawing time in microseconds since the last timing report.
+    std::atomic<uint64_t> paint_us{0};
+    std::atomic<uint32_t> paint_max_us{0};
+    std::atomic<uint32_t> paints{0};
+    std::atomic<uint32_t> seq{0};
 
     IXAudio2* xaudio = nullptr;
     IXAudio2MasteringVoice* master = nullptr;
@@ -404,7 +427,13 @@ struct Client {
     uint32_t audio_next = 0;
 
     bool fullscreen = false;
+    int fullscreen_retries = 0;
     WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
+
+    // Smoothed round trip in ms, or -1 before the first reply of this connection.
+    std::atomic<int32_t> ping_ms{-1};
+    HFONT ping_font = nullptr;
+    int ping_font_height = 0;
 };
 Client* g_client = nullptr;
 
@@ -481,6 +510,14 @@ void ClientNetwork(Client& c) {
     bool has_frame = false;
     uint32_t last_frame = 0, last_request = 0;
     uint32_t last_stats = NowMs();
+    uint32_t last_ping = 0;
+    PingFilter ping;
+    // Logged every kTimingLogMs so slow decoding or drawing on a device shows up in the log.
+    struct Timing {
+        uint32_t start = 0, inputs = 0, outputs = 0, decode_max_us = 0;
+        uint64_t decode_us = 0;
+    } timing;
+    timing.start = NowMs();
     StreamStats stats{};
     SequenceCounter sequence;
     uint32_t last_assembler_dropped = 0;
@@ -506,6 +543,23 @@ void ClientNetwork(Client& c) {
             stats = StreamStats{};
             last_stats = now;
         }
+        if (now - timing.start >= kTimingLogMs) {
+            const uint32_t paints = c.paints.exchange(0);
+            const uint64_t paint_us = c.paint_us.exchange(0);
+            const uint32_t paint_max = c.paint_max_us.exchange(0);
+            if (timing.inputs)
+                LOGI("stream: %u frames in, %u out; decode avg %.1f ms, max %.1f ms; %u draws, avg %.1f ms, max %.1f ms; ping %d ms",
+                     timing.inputs, timing.outputs, double(timing.decode_us) / timing.inputs / 1000.0,
+                     timing.decode_max_us / 1000.0, paints, paints ? double(paint_us) / paints / 1000.0 : 0.0,
+                     paint_max / 1000.0, int(c.ping_ms.load(std::memory_order_acquire)));
+            timing = Timing{};
+            timing.start = now;
+        }
+        if (c.connected.load(std::memory_order_acquire) && now - last_ping >= kPingIntervalMs) {
+            const PingPayload sent{now};
+            ClientSend(c, PacketType::Ping, 0, &sent, sizeof(sent));
+            last_ping = now;
+        }
         if (n <= 0 || !SameAddress(from, c.host) || !ParsePacket(buffer.data(), size_t(n), header, payload)) continue;
         c.last_packet.store(NowMs(), std::memory_order_release);
         if (c.connected.load(std::memory_order_acquire)) sequence.Add(header.seq, stats);
@@ -519,6 +573,9 @@ void ClientNetwork(Client& c) {
                 last_stats = NowMs();
                 stats = StreamStats{};
                 sequence.Reset();
+                ping.Reset();
+                c.ping_ms.store(-1, std::memory_order_release);
+                last_ping = NowMs() - kPingIntervalMs;
                 last_assembler_dropped = assembler.Dropped();
                 last_assembler_recovered = assembler.Recovered();
                 has_seen_frame_id = false;
@@ -567,7 +624,15 @@ void ClientNetwork(Client& c) {
             }
             if (key) waiting_keyframe = false;
             bool failed = false;
-            if (!decoder.Decode(encoded.data(), encoded.size(), chunk.width, chunk.height, pixels, failed)) {
+            const auto decode_start = std::chrono::steady_clock::now();
+            const bool decoded = decoder.Decode(encoded.data(), encoded.size(), chunk.width, chunk.height, pixels, failed);
+            const uint32_t decode_us = uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - decode_start).count());
+            ++timing.inputs;
+            timing.decode_us += decode_us;
+            timing.decode_max_us = std::max(timing.decode_max_us, decode_us);
+            if (decoded) ++timing.outputs;
+            if (!decoded) {
                 if (failed) {
                     decoder.Reset();
                     waiting_keyframe = true;
@@ -580,8 +645,20 @@ void ClientNetwork(Client& c) {
                 c.frame.swap(pixels);
                 c.frame_w = chunk.width;
                 c.frame_h = chunk.height;
+                c.frame_aspect = chunk.aspect ? float(chunk.aspect) / 1000.f : 4.f / 3.f;
+                c.frame_new = true;
             }
             InvalidateRect(c.window, nullptr, FALSE);
+        } else if (type == PacketType::Pong && header.size == sizeof(PingPayload)) {
+            PingPayload reply;
+            std::memcpy(&reply, payload, sizeof(reply));
+            const uint32_t rtt = now - reply.sent_ms;
+            // A reply older than the timeout belongs to an earlier connection.
+            if (rtt <= kPeerTimeoutMs) {
+                c.ping_ms.store(int32_t(ping.Add(rtt)), std::memory_order_release);
+                // Keeps the value current while the picture is still, when no frame triggers a repaint.
+                InvalidateRect(c.window, nullptr, FALSE);
+            }
         } else if (type == PacketType::Audio && header.size > sizeof(AudioChunk)) {
             AudioChunk chunk;
             std::memcpy(&chunk, payload, sizeof(chunk));
@@ -593,6 +670,8 @@ void ClientNetwork(Client& c) {
             has_seen_frame_id = false;
             stats = StreamStats{};
             sequence.Reset();
+            ping.Reset();
+            c.ping_ms.store(-1, std::memory_order_release);
             if (c.connected.exchange(false)) LOGI("stream: host closed the session");
             PostMessageW(c.window, WM_APP + 1, 0, 0);
         }
@@ -601,23 +680,41 @@ void ClientNetwork(Client& c) {
 
 void ClientTitle(Client& c) {
     const wchar_t* title = c.connected.load(std::memory_order_acquire)
-        ? L"OpenShao - Player 2 (F11: full screen)"
+        ? L"OpenShao - Player 2 (F11 or double-click: full screen)"
         : L"OpenShao - Player 2 (connecting to host...)";
     SetWindowTextW(c.window, title);
+}
+
+constexpr UINT_PTR kFullscreenTimer = 1;
+constexpr int kFullscreenRetries = 8;
+
+// Covers the monitor. Returns true when the window already does.
+bool CoverMonitor(Client& c) {
+    MONITORINFO mi{sizeof(mi)};
+    RECT now{};
+    if (!GetMonitorInfoW(MonitorFromWindow(c.window, MONITOR_DEFAULTTOPRIMARY), &mi) || !GetWindowRect(c.window, &now))
+        return true;
+    if (EqualRect(&now, &mi.rcMonitor)) return true;
+    SetWindowPos(c.window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    return false;
 }
 
 void ToggleFullscreen(Client& c) {
     const LONG style = GetWindowLongW(c.window, GWL_STYLE);
     if (!c.fullscreen) {
-        MONITORINFO mi{sizeof(mi)};
-        if (!GetWindowPlacement(c.window, &c.placement) ||
-            !GetMonitorInfoW(MonitorFromWindow(c.window, MONITOR_DEFAULTTOPRIMARY), &mi))
-            return;
-        SetWindowLongW(c.window, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
-        SetWindowPos(c.window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
-                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        if (!GetWindowPlacement(c.window, &c.placement)) return;
+        // A borderless popup that covers the monitor is what Wine and window managers treat as full screen.
+        SetWindowLongW(c.window, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        CoverMonitor(c);
+        // Under Wine, a desktop window manager can first fit the window above its panel; Wine then
+        // drops the full-screen request because the window no longer covers the monitor. Asking again
+        // once the window manager settled sends the request with the full monitor size.
+        c.fullscreen_retries = kFullscreenRetries;
+        SetTimer(c.window, kFullscreenTimer, 150, nullptr);
     } else {
-        SetWindowLongW(c.window, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        KillTimer(c.window, kFullscreenTimer);
+        SetWindowLongW(c.window, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(c.window, &c.placement);
         SetWindowPos(c.window, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
@@ -625,32 +722,78 @@ void ToggleFullscreen(Client& c) {
     c.fullscreen = !c.fullscreen;
 }
 
+// Draws the round trip in the top-right corner, like the ping counter of online games.
+void PaintPing(Client& c, HDC dc, int cw, int ch) {
+    const int32_t ms = c.ping_ms.load(std::memory_order_acquire);
+    if (ms < 0 || !c.connected.load(std::memory_order_acquire)) return;
+    const int height = std::max(14, ch / 30);
+    if (!c.ping_font || c.ping_font_height != height) {
+        if (c.ping_font) DeleteObject(c.ping_font);
+        c.ping_font = CreateFontW(-height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                  CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        c.ping_font_height = height;
+    }
+    wchar_t text[32];
+    std::swprintf(text, 32, L"%d ms", int(ms));
+    HGDIOBJ old_font = SelectObject(dc, c.ping_font);
+    SIZE size{};
+    GetTextExtentPoint32W(dc, text, int(std::wcslen(text)), &size);
+    const int pad = height / 3, margin = height / 2;
+    RECT box{cw - margin - size.cx - pad * 2, margin, cw - margin, margin + size.cy + pad};
+    if (box.left < 0) box.left = 0;
+    HBRUSH back = CreateSolidBrush(RGB(16, 16, 16));
+    FillRect(dc, &box, back);
+    DeleteObject(back);
+    // Green, yellow and red follow the usual thresholds of online games.
+    SetTextColor(dc, ms < 60 ? RGB(110, 220, 120) : ms < 120 ? RGB(240, 200, 80) : RGB(240, 90, 80));
+    SetBkMode(dc, TRANSPARENT);
+    DrawTextW(dc, text, -1, &box, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, old_font);
+}
+
 void Paint(Client& c, HDC dc) {
+    const auto start = std::chrono::steady_clock::now();
     RECT rc;
     GetClientRect(c.window, &rc);
     const int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-    std::lock_guard guard(c.frame_lock);
-    if (c.frame.empty() || !c.frame_w || !c.frame_h) {
+    {
+        std::lock_guard guard(c.frame_lock);
+        if (c.frame_new) {
+            c.paint.swap(c.frame);
+            c.paint_w = c.frame_w;
+            c.paint_h = c.frame_h;
+            c.paint_aspect = c.frame_aspect;
+            c.frame_new = false;
+        }
+    }
+    if (c.paint.empty() || !c.paint_w || !c.paint_h) {
         FillRect(dc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        PaintPing(c, dc, cw, ch);
         return;
     }
-    // The guest image is 4:3; letterbox it inside the window.
-    int w = cw, h = cw * 3 / 4;
-    if (h > ch) { h = ch; w = ch * 4 / 3; }
+    // Letterbox the picture in the shape the host shows it, which follows its aspect ratio setting.
+    int w = cw, h = int(float(cw) / c.paint_aspect + .5f);
+    if (h > ch) { h = ch; w = int(float(ch) * c.paint_aspect + .5f); }
     const int x = (cw - w) / 2, y = (ch - h) / 2;
     HBRUSH black = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     RECT bars[4] = {{0, 0, cw, y}, {0, y + h, cw, ch}, {0, y, x, y + h}, {x + w, y, cw, y + h}};
     for (auto& bar : bars) if (bar.right > bar.left && bar.bottom > bar.top) FillRect(dc, &bar, black);
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = LONG(c.frame_w);
-    bi.bmiHeader.biHeight = -LONG(c.frame_h);
+    bi.bmiHeader.biWidth = LONG(c.paint_w);
+    bi.bmiHeader.biHeight = -LONG(c.paint_h);
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
     SetStretchBltMode(dc, HALFTONE);
     SetBrushOrgEx(dc, 0, 0, nullptr);
-    StretchDIBits(dc, x, y, w, h, 0, 0, int(c.frame_w), int(c.frame_h), c.frame.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+    StretchDIBits(dc, x, y, w, h, 0, 0, int(c.paint_w), int(c.paint_h), c.paint.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+    PaintPing(c, dc, cw, ch);
+    const uint32_t us = uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count());
+    c.paint_us.fetch_add(us, std::memory_order_relaxed);
+    c.paints.fetch_add(1, std::memory_order_relaxed);
+    if (us > c.paint_max_us.load(std::memory_order_relaxed)) c.paint_max_us.store(us, std::memory_order_relaxed);
 }
 
 LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -681,6 +824,16 @@ LRESULT CALLBACK ClientProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break;
+    case WM_TIMER:
+        if (wp == kFullscreenTimer) {
+            if (!c || !c->fullscreen || CoverMonitor(*c) || --c->fullscreen_retries <= 0) KillTimer(hwnd, kFullscreenTimer);
+            return 0;
+        }
+        break;
+    case WM_LBUTTONDBLCLK:
+        // A touch screen reports a double tap as a double click.
+        if (c) ToggleFullscreen(*c);
+        return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -886,7 +1039,7 @@ bool WantsVideo() {
     return !g_host.frame_ready;
 }
 
-void SubmitVideo(const uint8_t* bgra, uint32_t width, uint32_t height, uint32_t pitch) {
+void SubmitVideo(const uint8_t* bgra, uint32_t width, uint32_t height, uint32_t pitch, float aspect) {
     if (!g_host.connected.load(std::memory_order_acquire) || !width || !height || width > 4096 || height > 4096) return;
     {
         std::lock_guard guard(g_host.frame_lock);
@@ -895,6 +1048,7 @@ void SubmitVideo(const uint8_t* bgra, uint32_t width, uint32_t height, uint32_t 
             std::memcpy(&g_host.frame[size_t(y) * width * 4], bgra + size_t(y) * pitch, size_t(width) * 4);
         g_host.frame_w = width;
         g_host.frame_h = height;
+        g_host.frame_aspect = aspect > 0.5f && aspect < 8.f ? uint16_t(aspect * 1000.f + .5f) : 0;
         g_host.frame_ready = true;
     }
     g_host.frame_cv.notify_one();
@@ -916,6 +1070,37 @@ void SubmitAudio(const float* stereo, uint32_t frames, uint32_t rate) {
         if (rate != kAudioRate) LOG_FIRST(1, "stream: unsupported audio sample rate %u Hz", unsigned(rate));
         else LOG_FIRST(1, "stream: audio encoder initialization failed");
     }
+}
+
+void ClientInput(Client& c) {
+    // The default 15.6 ms timer tick would otherwise stretch the input interval.
+    timeBeginPeriod(1);
+    SDL_Gamepad* gamepad = nullptr;
+    uint32_t last_input = 0, last_hello = 0;
+    while (c.running.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const uint32_t now = NowMs();
+        if (c.connected.load(std::memory_order_acquire) &&
+            now - c.last_packet.load(std::memory_order_acquire) > kPeerTimeoutMs) {
+            c.connected.store(false);
+            LOGW("stream: lost the host, reconnecting");
+            PostMessageW(c.window, WM_APP + 1, 0, 0);
+        }
+        if (!c.connected.load(std::memory_order_acquire) && now - last_hello >= kHelloIntervalMs) {
+            ClientSend(c, PacketType::Hello, c.seq++);
+            last_hello = now;
+        }
+        if (c.connected.load(std::memory_order_acquire) && now - last_input >= kInputIntervalMs) {
+            SDL_UpdateGamepads();
+            RemotePad pad{};
+            ReadGamepad(gamepad, pad);
+            if (GetForegroundWindow() == c.window) ReadKeyboard(pad);
+            ClientSend(c, PacketType::Input, c.seq++, &pad, sizeof(pad));
+            last_input = now;
+        }
+    }
+    if (gamepad) SDL_CloseGamepad(gamepad);
+    timeEndPeriod(1);
 }
 
 int RunClient(const std::string& host, uint16_t port) {
@@ -956,14 +1141,26 @@ int RunClient(const std::string& host, uint16_t port) {
 
     HINSTANCE inst = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc{sizeof(wc)};
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     wc.lpfnWndProc = ClientProc;
     wc.hInstance = inst;
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)) /* IDC_ARROW */;
     wc.lpszClassName = L"OpenShaoStreamClient";
     RegisterClassExW(&wc);
-    RECT rc{0, 0, 960, 720};
+    // 960x720 when it fits; smaller screens get the largest 4:3 picture whose frame fits the work area.
+    RECT work{0, 0, 1280, 1024};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    RECT frame{0, 0, 0, 0};
+    AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+    const int border_w = frame.right - frame.left, border_h = frame.bottom - frame.top;
+    int view_w = 960, view_h = 720;
+    const int fit_w = (work.right - work.left) * 9 / 10 - border_w, fit_h = (work.bottom - work.top) * 9 / 10 - border_h;
+    if (fit_w > 0 && fit_h > 0 && (view_w > fit_w || view_h > fit_h)) {
+        view_w = std::min(fit_w, fit_h * 4 / 3);
+        view_h = view_w * 3 / 4;
+    }
+    RECT rc{0, 0, view_w, view_h};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
     g_client = &c;
     c.window = CreateWindowExW(0, wc.lpszClassName, L"", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -978,40 +1175,17 @@ int RunClient(const std::string& host, uint16_t port) {
     else LOGI("stream: connecting to host %s", AddressText(c.host).c_str());
 
     std::thread net(ClientNetwork, std::ref(c));
-    SDL_Gamepad* gamepad = nullptr;
-    uint32_t seq = 0, last_input = 0, last_hello = 0;
-    for (bool quit = false; !quit;) {
-        MsgWaitForMultipleObjects(0, nullptr, FALSE, 4, QS_ALLINPUT);
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) quit = true;
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        const uint32_t now = NowMs();
-        if (c.connected.load(std::memory_order_acquire) &&
-            now - c.last_packet.load(std::memory_order_acquire) > kPeerTimeoutMs) {
-            c.connected.store(false);
-            LOGW("stream: lost the host, reconnecting");
-            ClientTitle(c);
-        }
-        if (!c.connected.load(std::memory_order_acquire) && now - last_hello >= kHelloIntervalMs) {
-            ClientSend(c, PacketType::Hello, seq++);
-            last_hello = now;
-        }
-        if (c.connected.load(std::memory_order_acquire) && now - last_input >= kInputIntervalMs) {
-            SDL_UpdateGamepads();
-            RemotePad pad{};
-            ReadGamepad(gamepad, pad);
-            if (GetForegroundWindow() == c.window) ReadKeyboard(pad);
-            ClientSend(c, PacketType::Input, seq++, &pad, sizeof(pad));
-            last_input = now;
-        }
+    // Input has its own thread so that slow drawing in full screen never delays Player 2's buttons.
+    std::thread input(ClientInput, std::ref(c));
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
-    for (int i = 0; i < 3; ++i) ClientSend(c, PacketType::Bye, seq++);
     c.running.store(false);
+    input.join();
+    for (int i = 0; i < 3; ++i) ClientSend(c, PacketType::Bye, c.seq++);
     net.join();
-    if (gamepad) SDL_CloseGamepad(gamepad);
     SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
     if (c.voice) c.voice->DestroyVoice();
     if (c.master) c.master->DestroyVoice();
@@ -1019,6 +1193,7 @@ int RunClient(const std::string& host, uint16_t port) {
     if (c.sock != INVALID_SOCKET) closesocket(c.sock);
     if (c.ice) CancelOnline();
     g_client = nullptr;
+    if (c.ping_font) DeleteObject(c.ping_font);
     return 0;
 }
 

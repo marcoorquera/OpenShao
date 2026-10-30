@@ -468,6 +468,18 @@ int main() {
         Check(reset.packets_expected == 1 && reset.packets_received == 1, "Reset starts a new count");
     }
 
+    // 12b. PingFilter smoothing
+    {
+        PingFilter ping;
+        Check(!ping.Started(), "ping starts without a value");
+        Check(ping.Add(80) == 80, "first ping sample is shown directly");
+        Check(ping.Add(200) == 110, "one late reply moves the ping by a quarter");
+        for (int i = 0; i < 40; ++i) ping.Add(40);
+        Check(ping.Value() == 40, "steady samples converge");
+        ping.Reset();
+        Check(!ping.Started() && ping.Add(15) == 15, "Reset forgets the previous ping");
+    }
+
     // 13. Connection codes (Invite & Reply), whitespace tolerance and error handling
     {
         ConnectionCode invite{};
