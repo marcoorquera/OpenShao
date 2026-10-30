@@ -20,6 +20,7 @@ public:
     // which can be empty when the encoder buffers the frame.
     bool Encode(const uint8_t* nv12, uint32_t width, uint32_t height, bool keyframe,
                 std::vector<uint8_t>& out, bool& is_keyframe);
+    void SetBitrate(uint32_t bps);
 
 private:
     struct State;

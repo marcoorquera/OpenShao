@@ -14,7 +14,7 @@ namespace openshao::stream {
 
 inline constexpr uint16_t kDefaultPort = 27886;
 inline constexpr uint32_t kMagic = 0x5453484Fu; // 'OHST'
-inline constexpr uint8_t kVersion = 3;
+inline constexpr uint8_t kVersion = 4;
 // Keeps every datagram below a 1280-byte IPv6 minimum MTU.
 inline constexpr size_t kMaxChunk = 1180;
 inline constexpr uint32_t kPeerTimeoutMs = 3000;
@@ -27,11 +27,15 @@ inline constexpr uint32_t kAudioResyncPackets = 50; // 500 ms
 inline constexpr uint8_t kVideoCodecH264 = 1;
 inline constexpr uint8_t kVideoFlagKeyframe = 1;
 inline constexpr uint32_t kVideoFrameRate = 60;
-inline constexpr uint32_t kVideoBitrate = 8'000'000;
+inline constexpr uint32_t kVideoBitrate = 12'000'000;
 inline constexpr uint32_t kVideoGopFrames = 240;    // a periodic keyframe repairs any missed request
 inline constexpr uint32_t kVideoMaxWidth = 1280;
 inline constexpr uint32_t kVideoMaxHeight = 960;
 inline constexpr uint32_t kKeyframeRequestMs = 250;
+inline constexpr uint8_t kFecGroup = 8;
+inline constexpr uint32_t kStatsIntervalMs = 500;
+inline constexpr uint32_t kMinVideoBitrate = 2'000'000;
+inline constexpr uint32_t kMaxVideoBitrate = kVideoBitrate;
 
 enum class PacketType : uint8_t {
     Hello = 1,
@@ -40,7 +44,8 @@ enum class PacketType : uint8_t {
     Video = 4,
     Audio = 5,
     Bye = 6,
-    KeyframeRequest = 7
+    KeyframeRequest = 7,
+    Stats = 8
 };
 
 #pragma pack(push, 1)
@@ -67,7 +72,8 @@ struct VideoChunk {
     uint16_t count = 0;
     uint8_t codec = kVideoCodecH264;
     uint8_t flags = 0;
-    uint16_t reserved = 0;
+    uint8_t fec_group = 0;
+    uint8_t fec_count = 0;
 };
 
 struct AudioChunk {
@@ -76,20 +82,32 @@ struct AudioChunk {
     uint16_t codec = 0;  // 1 = Opus
     uint32_t index = 0;  // per-audio packet counter
 };
+
+struct StreamStats {
+    uint32_t packets_received = 0;  // host packets since the last Stats
+    uint32_t packets_expected = 0;  // host sequence numbers passed since the last Stats
+    uint32_t frames_recovered = 0; // frames completed thanks to parity
+    uint32_t frames_lost = 0;      // frame ids skipped or never completed
+};
 #pragma pack(pop)
 
 static_assert(sizeof(Header) == 12, "stream header layout must remain fixed");
 static_assert(sizeof(RemotePad) == 16, "remote pad layout must remain fixed");
 static_assert(sizeof(VideoChunk) == 20, "video chunk layout must remain fixed");
 static_assert(sizeof(AudioChunk) == 12, "audio chunk layout must remain fixed");
+static_assert(sizeof(StreamStats) == 16, "stream stats layout must remain fixed");
 
 bool ParsePacket(const uint8_t* data, size_t size, Header& header, const uint8_t*& payload);
 std::vector<uint8_t> BuildPacket(PacketType type, uint32_t seq, const void* payload, size_t size,
                                  const void* extra = nullptr, size_t extra_size = 0);
 uint16_t ChunkCount(size_t total);
+void BuildParity(const uint8_t* data, size_t total, uint16_t count, uint8_t group, std::vector<uint8_t>& parity);
 
 // Integer downscale factor that fits a captured frame inside kVideoMaxWidth x kVideoMaxHeight.
 uint32_t VideoScale(uint32_t width, uint32_t height);
+// Size that the GPU shrinks a rendered frame to before readback: the largest even size inside
+// kVideoMaxWidth x kVideoMaxHeight with the frame's aspect ratio. It never enlarges the frame.
+void CaptureSize(uint32_t width, uint32_t height, uint32_t& out_width, uint32_t& out_height);
 // BT.709 limited range. BgraToNv12 box-filters by `scale` and rounds the output size down to even.
 void BgraToNv12(const uint8_t* bgra, uint32_t pitch, uint32_t width, uint32_t height, uint32_t scale,
                 std::vector<uint8_t>& nv12, uint32_t& out_width, uint32_t& out_height);
@@ -192,18 +210,57 @@ class FrameAssembler {
 public:
     bool Add(const VideoChunk& chunk, const uint8_t* data, size_t size, std::vector<uint8_t>& complete);
     uint32_t Dropped() const { return dropped_; }
+    uint32_t Recovered() const { return recovered_; }
+    bool IsFrameComplete(uint32_t frame) const { return has_complete_ && int32_t(frame - last_complete_) <= 0; }
+    bool IsActive() const { return active_; }
 
 private:
+    void TryRecover(uint8_t g);
+
     uint32_t frame_ = 0;
     bool active_ = false;
     uint32_t total_ = 0;
     uint16_t count_ = 0;
+    uint8_t fec_group_ = 0;
+    uint8_t fec_count_ = 0;
     uint16_t received_ = 0;
     uint32_t last_complete_ = 0;
     bool has_complete_ = false;
     uint32_t dropped_ = 0;
+    uint32_t recovered_ = 0;
+    bool recovered_this_frame_ = false;
     std::vector<uint8_t> data_;
     std::vector<bool> have_;
+    std::vector<bool> have_parity_;
+    std::vector<uint8_t> parity_data_;
+};
+
+// Counts host packets for StreamStats by header sequence number. A packet counts as expected only
+// once a later one arrives, so a report sent while a frame's parity is still in flight shows no loss.
+class SequenceCounter {
+public:
+    void Add(uint32_t seq, StreamStats& stats);
+    void Reset() { started_ = false; }
+
+private:
+    bool started_ = false;
+    uint32_t highest_ = 0;
+};
+
+class BitrateController {
+public:
+    explicit BitrateController(uint32_t start = kVideoBitrate);
+    uint32_t Update(const StreamStats& s, uint32_t now_ms);
+    uint32_t Bitrate() const { return bitrate_; }
+
+private:
+    uint32_t bitrate_ = kVideoBitrate;
+    uint32_t last_drop_ms_ = 0;
+    bool has_dropped_ = false;
+    uint32_t last_raise_ms_ = 0;
+    bool has_raised_ = false;
+    uint32_t clean_start_ms_ = 0;
+    bool clean_active_ = false;
 };
 
 // Host side. All calls are cheap no-ops without a connected client.

@@ -138,6 +138,7 @@ struct VideoEncoder::State {
     DWORD output_size = 0;
     DWORD in_id = 0, out_id = 0;
     uint32_t width = 0, height = 0;
+    uint32_t bitrate = kVideoBitrate;
     int need_input = 0;
     UINT64 start = 0;
 
@@ -173,14 +174,14 @@ struct VideoEncoder::State {
         // Rate control must be chosen before the media types on the Microsoft software encoder.
         SetCodecFlag(api.Get(), CODECAPI_AVLowLatencyMode);
         SetCodecValue(api.Get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
-        SetCodecValue(api.Get(), CODECAPI_AVEncCommonMeanBitRate, kVideoBitrate);
+        SetCodecValue(api.Get(), CODECAPI_AVEncCommonMeanBitRate, bitrate);
         SetCodecValue(api.Get(), CODECAPI_AVEncMPVGOPSize, kVideoGopFrames);
         SetCodecValue(api.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
 
         auto out_type = VideoType(MFVideoFormat_H264, w, h);
         auto in_type = VideoType(MFVideoFormat_NV12, w, h);
         if (!out_type || !in_type) return false;
-        out_type->SetUINT32(MF_MT_AVG_BITRATE, kVideoBitrate);
+        out_type->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
         out_type->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
         DWORD in = 0, out = 0;
         StreamIds(transform, in, out);
@@ -346,6 +347,12 @@ bool VideoEncoder::Encode(const uint8_t* nv12, uint32_t width, uint32_t height, 
         s.Close();
     }
     return ok;
+}
+
+void VideoEncoder::SetBitrate(uint32_t bps) {
+    if (!s_) return;
+    s_->bitrate = bps;
+    SetCodecValue(s_->codec.Get(), CODECAPI_AVEncCommonMeanBitRate, bps);
 }
 
 // ---------------------------------------------------------------- decoder
@@ -526,6 +533,7 @@ struct VideoEncoder::State {};
 VideoEncoder::VideoEncoder() = default;
 VideoEncoder::~VideoEncoder() = default;
 bool VideoEncoder::Encode(const uint8_t*, uint32_t, uint32_t, bool, std::vector<uint8_t>&, bool&) { return false; }
+void VideoEncoder::SetBitrate(uint32_t) {}
 
 struct VideoDecoder::State {};
 VideoDecoder::VideoDecoder() = default;

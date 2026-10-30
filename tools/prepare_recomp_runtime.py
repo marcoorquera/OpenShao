@@ -818,8 +818,10 @@ uint32_t OpenOnDisc(''')
         '        if (std::getenv("OPENSHAO_CAPTURE_NATIVE_PIXELS"))\n'
         '            CapSave({.res=f->res.Get(), .state=&f->state, .fmt=f->fmt, .w=f->w, .h=f->h, .mul=f->range}, "final_native");\n'
         '    }')
-    # LAN streaming: copy the guest-sized frame into a readback buffer of the frame slot and
-    # hand it over once that slot's fence completes, so the capture never stalls the GPU.
+    # LAN streaming: shrink the rendered frame to the stream size, copy it into a readback buffer
+    # of the frame slot and hand it over once that slot's fence completes, so the capture never
+    # stalls the GPU. The stream size follows the render scale, not the guest size, so the viewer
+    # keeps the host's extra detail.
     backend = '#include "stream.h"\n' + backend
     backend = replace_once(backend, '    Frame frames_[kFrames];',
         '    Frame frames_[kFrames];\n'
@@ -842,7 +844,16 @@ uint32_t OpenOnDisc(''')
         'void D3D12Backend::StreamCapture(Target& t) {\n'
         '    StreamReadback& rb = stream_rb_[frame_ % kFrames];\n'
         '    if (rb.pending) return;\n'
-        '    CopySource src = PrepareCopySource(t, {});\n'
+        '    uint32_t sw = 0, sh = 0;\n'
+        '    openshao::stream::CaptureSize(t.w, t.h, sw, sh);\n'
+        '    CopySource src{t.res.Get(), nullptr};\n'
+        '    if (sw != t.w || sh != t.h || t.fmt != kBgra) {\n'
+        '        const uint32_t taps = uint32_t(std::ceil(std::max(float(t.w) / float(sw), 1.0f) - kTapsSlack));\n'
+        '        src.down = Shrink(t.res.Get(), t.state, t.fmt, sw, sh, {.taps = taps});\n'
+        '        src.res = src.down.Get();\n'
+        '    } else {\n'
+        '        Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_COPY_SOURCE);\n'
+        '    }\n'
         '    if (!src.res) return;\n'
         '    D3D12_RESOURCE_DESC rd = src.res->GetDesc();\n'
         '    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;\n'
