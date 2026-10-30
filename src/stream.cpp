@@ -1,4 +1,6 @@
 #include "stream.h"
+#include "stream_ice.h"
+#include "stream_invite.h"
 #include "stream_upnp.h"
 #include "stream_video.h"
 
@@ -30,7 +32,9 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <random>
 #include <thread>
 
 namespace openshao::stream {
@@ -53,6 +57,22 @@ int RunClient(const std::string&, uint16_t) {
     LOGE("stream: LAN streaming is available on Windows");
     return 2;
 }
+void CreateInvite() {}
+bool AcceptReply(const std::string&, std::string& error) {
+    error = "Internet play is available on Windows";
+    return false;
+}
+bool JoinInvite(const std::string&, std::string& error) {
+    error = "Internet play is available on Windows";
+    return false;
+}
+OnlineStatus Online() {
+    OnlineStatus status;
+    status.step = OnlineStep::Failed;
+    status.error = "Internet play is available on Windows";
+    return status;
+}
+void CancelOnline() {}
 
 #else
 
@@ -65,6 +85,7 @@ constexpr uint32_t kHelloIntervalMs = 250;
 constexpr uint32_t kPrefillAudio = 3;    // 30 ms of 10 ms packets
 constexpr uint32_t kMaxQueuedAudio = 12; // 120 ms of 10 ms packets
 constexpr uint32_t kAudioSlots = 64;
+constexpr uint32_t kReceiveTimeoutMs = 20;
 
 uint32_t NowMs() {
     return uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -102,9 +123,22 @@ SOCKET OpenSocket(uint16_t port, std::string& error) {
         closesocket(s);
         return INVALID_SOCKET;
     }
-    DWORD timeout = 20;
+    DWORD timeout = kReceiveTimeoutMs;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
     return s;
+}
+
+// One datagram from the LAN socket or the internet link; 0 or less after the receive timeout. The
+// internet link has a single peer, so `from` keeps the caller's value there.
+int ReceivePacket(SOCKET sock, IceLink* ice, std::vector<uint8_t>& buffer, sockaddr_in& from) {
+    if (ice) {
+        const int n = ice->Receive(buffer.data(), buffer.size(), kReceiveTimeoutMs);
+        if (n < 0) std::this_thread::sleep_for(std::chrono::milliseconds(kReceiveTimeoutMs));
+        return n;
+    }
+    int from_len = sizeof(from);
+    return recvfrom(sock, reinterpret_cast<char*>(buffer.data()), int(buffer.size()), 0,
+                    reinterpret_cast<sockaddr*>(&from), &from_len);
 }
 
 bool SameAddress(const sockaddr_in& a, const sockaddr_in& b) {
@@ -123,10 +157,31 @@ struct ComScope {
     ~ComScope() { if (SUCCEEDED(hr)) CoUninitialize(); }
 };
 
+// ---------------------------------------------------------------- internet session
+
+// The launcher prepares the link and the session takes it over in the same process.
+struct OnlineSession {
+    std::mutex lock;
+    std::unique_ptr<IceLink> link;
+    bool host = false;
+    bool accepted = false;  // host: a reply code started the connectivity checks
+    uint32_t session = 0;
+    std::string code, error;
+};
+OnlineSession g_online;
+
+// The link once both codes are exchanged on this side, for the given role.
+IceLink* PreparedLink(bool host) {
+    std::lock_guard guard(g_online.lock);
+    if (!g_online.link || g_online.host != host || (host && !g_online.accepted)) return nullptr;
+    return g_online.link.get();
+}
+
 // ---------------------------------------------------------------- host
 
 struct Host {
     SOCKET sock = INVALID_SOCKET;
+    IceLink* ice = nullptr;  // internet play; set before the threads start
     std::atomic<bool> running{false};
     std::atomic<bool> connected{false};
     std::atomic<uint32_t> seq{0};
@@ -161,35 +216,37 @@ void HostSend(const void* data, size_t size) {
         if (!g_host.connected.load(std::memory_order_acquire)) return;
         to = g_host.peer;
     }
-    sendto(g_host.sock, static_cast<const char*>(data), int(size), 0,
-           reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+    if (g_host.ice) g_host.ice->Send(data, size);
+    else sendto(g_host.sock, static_cast<const char*>(data), int(size), 0, reinterpret_cast<const sockaddr*>(&to), sizeof(to));
 }
 
 void HostSend(const std::vector<uint8_t>& packet) {
     HostSend(packet.data(), packet.size());
 }
 
+std::string HostPeerText() {
+    return g_host.ice ? "the internet, " + g_host.ice->Route() : AddressText(g_host.peer);
+}
+
 void HostDisconnect(const char* reason) {
     std::lock_guard guard(g_host.peer_lock);
     if (!g_host.connected.exchange(false)) return;
     g_host.pad = {};
-    LOGI("stream: Player 2 %s (%s)", reason, AddressText(g_host.peer).c_str());
+    LOGI("stream: Player 2 %s (%s)", reason, HostPeerText().c_str());
 }
 
 void HostNetwork() {
     std::vector<uint8_t> buffer(2048);
     while (g_host.running.load(std::memory_order_acquire)) {
         sockaddr_in from{};
-        int from_len = sizeof(from);
-        const int n = recvfrom(g_host.sock, reinterpret_cast<char*>(buffer.data()), int(buffer.size()), 0,
-                               reinterpret_cast<sockaddr*>(&from), &from_len);
+        const int n = ReceivePacket(g_host.sock, g_host.ice, buffer, from);
         const uint32_t now = NowMs();
         Header header;
         const uint8_t* payload = nullptr;
         if (n > 0 && ParsePacket(buffer.data(), size_t(n), header, payload)) {
             const auto type = PacketType(header.type);
             std::unique_lock guard(g_host.peer_lock);
-            const bool from_peer = g_host.connected.load(std::memory_order_acquire) && SameAddress(from, g_host.peer);
+            const bool from_peer = g_host.connected.load(std::memory_order_acquire) && (g_host.ice || SameAddress(from, g_host.peer));
             if (type == PacketType::Hello && (from_peer || !g_host.connected.load(std::memory_order_acquire))) {
                 if (!from_peer) {
                     g_host.peer = from;
@@ -200,7 +257,7 @@ void HostNetwork() {
                     g_host.video_bitrate.store(kVideoBitrate, std::memory_order_release);
                     g_host.bitrate_changed.store(true, std::memory_order_release);
                     g_host.last_bitrate_log_ms = 0;
-                    LOGI("stream: Player 2 connected from %s", AddressText(from).c_str());
+                    LOGI("stream: Player 2 connected from %s", HostPeerText().c_str());
                 }
                 g_host.last_seen = now;
                 guard.unlock();
@@ -326,6 +383,7 @@ void HostEncoder() {
 
 struct Client {
     SOCKET sock = INVALID_SOCKET;
+    IceLink* ice = nullptr;  // internet play; set before the network thread starts
     sockaddr_in host{};
     HWND window = nullptr;
     std::atomic<bool> running{true};
@@ -352,8 +410,13 @@ Client* g_client = nullptr;
 
 void ClientSend(Client& c, PacketType type, uint32_t seq, const void* payload = nullptr, size_t size = 0) {
     const auto packet = BuildPacket(type, seq, payload, size);
-    sendto(c.sock, reinterpret_cast<const char*>(packet.data()), int(packet.size()), 0,
-           reinterpret_cast<const sockaddr*>(&c.host), sizeof(c.host));
+    if (c.ice) c.ice->Send(packet.data(), packet.size());
+    else sendto(c.sock, reinterpret_cast<const char*>(packet.data()), int(packet.size()), 0,
+                reinterpret_cast<const sockaddr*>(&c.host), sizeof(c.host));
+}
+
+std::string ClientHostText(const Client& c) {
+    return c.ice ? "the internet, " + c.ice->Route() : AddressText(c.host);
 }
 
 void ClientAudio(Client& c, const AudioChunk& chunk, const uint8_t* samples, size_t size) {
@@ -432,10 +495,8 @@ void ClientNetwork(Client& c) {
         }
     };
     while (c.running.load(std::memory_order_acquire)) {
-        sockaddr_in from{};
-        int from_len = sizeof(from);
-        const int n = recvfrom(c.sock, reinterpret_cast<char*>(buffer.data()), int(buffer.size()), 0,
-                               reinterpret_cast<sockaddr*>(&from), &from_len);
+        sockaddr_in from = c.host;
+        const int n = ReceivePacket(c.sock, c.ice, buffer, from);
         Header header;
         const uint8_t* payload = nullptr;
         const uint32_t now = NowMs();
@@ -461,7 +522,7 @@ void ClientNetwork(Client& c) {
                 last_assembler_dropped = assembler.Dropped();
                 last_assembler_recovered = assembler.Recovered();
                 has_seen_frame_id = false;
-                LOGI("stream: connected to host %s", AddressText(c.host).c_str());
+                LOGI("stream: connected to host %s", ClientHostText(c).c_str());
                 PostMessageW(c.window, WM_APP + 1, 0, 0);
             }
         } else if (type == PacketType::Video && header.size > sizeof(VideoChunk)) {
@@ -681,15 +742,22 @@ void ReadGamepad(SDL_Gamepad*& gamepad, RemotePad& pad) {
 
 bool StartHost(uint16_t port, std::string& error) {
     StopHost();
-    if (!StartSockets(error)) return false;
-    g_host.sock = OpenSocket(port, error);
-    if (g_host.sock == INVALID_SOCKET) return false;
+    g_host.ice = PreparedLink(true);
+    if (!g_host.ice) {
+        if (!StartSockets(error)) return false;
+        g_host.sock = OpenSocket(port, error);
+        if (g_host.sock == INVALID_SOCKET) return false;
+    }
     g_host.connected.store(false);
     g_host.running.store(true);
     g_host.net = std::thread(HostNetwork);
     g_host.encoder = std::thread(HostEncoder);
-    upnp::Start(port);
-    LOGI("stream: hosting on UDP port %u, waiting for Player 2", unsigned(port));
+    if (g_host.ice) {
+        LOGI("stream: hosting over the internet, waiting for Player 2");
+    } else {
+        upnp::Start(port);
+        LOGI("stream: hosting on UDP port %u, waiting for Player 2", unsigned(port));
+    }
     return true;
 }
 
@@ -703,9 +771,100 @@ void StopHost() {
     g_host.frame_cv.notify_all();
     if (g_host.net.joinable()) g_host.net.join();
     if (g_host.encoder.joinable()) g_host.encoder.join();
-    closesocket(g_host.sock);
+    if (g_host.sock != INVALID_SOCKET) closesocket(g_host.sock);
     g_host.sock = INVALID_SOCKET;
     g_host.connected.store(false);
+    if (g_host.ice) {
+        g_host.ice = nullptr;
+        CancelOnline();
+    }
+}
+
+void CreateInvite() {
+    CancelOnline();
+    auto link = std::make_unique<IceLink>();
+    std::string error;
+    const bool started = link->Start(error);
+    std::random_device device;
+    std::lock_guard guard(g_online.lock);
+    g_online.host = true;
+    g_online.session = device() | 1u;
+    if (started) g_online.link = std::move(link);
+    else g_online.error = error;
+}
+
+bool AcceptReply(const std::string& reply, std::string& error) {
+    std::lock_guard guard(g_online.lock);
+    if (!g_online.link || !g_online.host || g_online.accepted || g_online.link->State() != IceState::Ready) {
+        error = "Create an invite first and wait until its code appears.";
+        return false;
+    }
+    ConnectionCode code;
+    if (!DecodeCode(reply, CodeKind::Reply, code, error)) return false;
+    if (code.session != g_online.session) {
+        error = "This reply answers a different invite. Ask your friend to paste your latest invite code.";
+        return false;
+    }
+    if (!g_online.link->SetRemote(code.description, error)) return false;
+    g_online.accepted = true;
+    return true;
+}
+
+bool JoinInvite(const std::string& invite, std::string& error) {
+    ConnectionCode code;
+    if (!DecodeCode(invite, CodeKind::Invite, code, error)) return false;
+    CancelOnline();
+    auto link = std::make_unique<IceLink>();
+    if (!link->Start(error) || !link->SetRemote(code.description, error)) return false;
+    std::lock_guard guard(g_online.lock);
+    g_online.host = false;
+    g_online.session = code.session;
+    g_online.link = std::move(link);
+    return true;
+}
+
+OnlineStatus Online() {
+    std::lock_guard guard(g_online.lock);
+    OnlineStatus status;
+    status.host = g_online.host;
+    if (!g_online.link) {
+        status.step = g_online.error.empty() ? OnlineStep::Idle : OnlineStep::Failed;
+        status.error = g_online.error;
+        return status;
+    }
+    const IceState state = g_online.link->State();
+    // The code is made once: the link keeps its port and credentials for the whole session.
+    if (g_online.code.empty() && state >= IceState::Ready && state != IceState::Failed) {
+        const std::string local = g_online.link->LocalDescription();
+        if (!local.empty())
+            g_online.code = EncodeCode({g_online.host ? CodeKind::Invite : CodeKind::Reply, g_online.session, local});
+    }
+    status.code = g_online.code;
+    switch (state) {
+        case IceState::Idle:
+        case IceState::Gathering: status.step = OnlineStep::Preparing; break;
+        case IceState::Ready: status.step = g_online.code.empty() ? OnlineStep::Preparing : OnlineStep::Waiting; break;
+        case IceState::Connecting: status.step = g_online.code.empty() ? OnlineStep::Preparing : OnlineStep::Connecting; break;
+        case IceState::Connected: status.step = OnlineStep::Connected; break;
+        case IceState::Failed:
+            status.step = OnlineStep::Failed;
+            status.error = g_online.host ? "The connection failed. Create a new invite." : "The connection failed. Ask the host for a new invite.";
+            break;
+    }
+    return status;
+}
+
+void CancelOnline() {
+    std::unique_ptr<IceLink> link;
+    {
+        std::lock_guard guard(g_online.lock);
+        link = std::move(g_online.link);
+        g_online.host = g_online.accepted = false;
+        g_online.session = 0;
+        g_online.code.clear();
+        g_online.error.clear();
+    }
+    if (link) link->Stop();
 }
 
 bool HostActive() { return g_host.running.load(std::memory_order_acquire); }
@@ -762,24 +921,27 @@ void SubmitAudio(const float* stereo, uint32_t frames, uint32_t rate) {
 int RunClient(const std::string& host, uint16_t port) {
     std::string error;
     Client c;
-    if (!StartSockets(error)) {
-        LOGE("stream: %s", error.c_str());
-        return 5;
-    }
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    addrinfo* res = nullptr;
-    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) {
-        LOGE("stream: cannot resolve host address %s", host.c_str());
-        return 5;
-    }
-    std::memcpy(&c.host, res->ai_addr, sizeof(c.host));
-    freeaddrinfo(res);
-    c.sock = OpenSocket(0, error);
-    if (c.sock == INVALID_SOCKET) {
-        LOGE("stream: %s", error.c_str());
-        return 5;
+    c.ice = PreparedLink(false);
+    if (!c.ice) {
+        if (!StartSockets(error)) {
+            LOGE("stream: %s", error.c_str());
+            return 5;
+        }
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        addrinfo* res = nullptr;
+        if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) {
+            LOGE("stream: cannot resolve host address %s", host.c_str());
+            return 5;
+        }
+        std::memcpy(&c.host, res->ai_addr, sizeof(c.host));
+        freeaddrinfo(res);
+        c.sock = OpenSocket(0, error);
+        if (c.sock == INVALID_SOCKET) {
+            LOGE("stream: %s", error.c_str());
+            return 5;
+        }
     }
 
     ComScope com(COINIT_APARTMENTTHREADED);
@@ -812,7 +974,8 @@ int RunClient(const std::string& host, uint16_t port) {
     }
     ClientTitle(c);
     ShowWindow(c.window, SW_SHOW);
-    LOGI("stream: connecting to host %s", AddressText(c.host).c_str());
+    if (c.ice) LOGI("stream: connecting to the host over the internet");
+    else LOGI("stream: connecting to host %s", AddressText(c.host).c_str());
 
     std::thread net(ClientNetwork, std::ref(c));
     SDL_Gamepad* gamepad = nullptr;
@@ -853,7 +1016,8 @@ int RunClient(const std::string& host, uint16_t port) {
     if (c.voice) c.voice->DestroyVoice();
     if (c.master) c.master->DestroyVoice();
     if (c.xaudio) c.xaudio->Release();
-    closesocket(c.sock);
+    if (c.sock != INVALID_SOCKET) closesocket(c.sock);
+    if (c.ice) CancelOnline();
     g_client = nullptr;
     return 0;
 }
